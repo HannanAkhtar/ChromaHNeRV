@@ -369,6 +369,38 @@ def ycbcr_to_rgb(image: torch.Tensor) -> torch.Tensor:
     return torch.stack([r, g, b], -3)
 
 
+def rgb_to_ycbcr_bt709(rgb: torch.Tensor) -> torch.Tensor:
+    """Convert full-range normalized RGB tensors to BT.709 YCbCr."""
+    if not isinstance(rgb, torch.Tensor):
+        raise TypeError(f"Input type is not a torch.Tensor. Got {type(rgb)}")
+    if len(rgb.shape) < 3 or rgb.shape[-3] != 3:
+        raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {rgb.shape}")
+
+    r = rgb[..., 0, :, :]
+    g = rgb[..., 1, :, :]
+    b = rgb[..., 2, :, :]
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    cb = (b - y) / 1.8556 + 0.5
+    cr = (r - y) / 1.5748 + 0.5
+    return torch.stack([y, cb, cr], -3)
+
+
+def ycbcr_to_rgb_bt709(ycbcr: torch.Tensor) -> torch.Tensor:
+    """Convert full-range normalized BT.709 YCbCr tensors to RGB."""
+    if not isinstance(ycbcr, torch.Tensor):
+        raise TypeError(f"Input type is not a torch.Tensor. Got {type(ycbcr)}")
+    if len(ycbcr.shape) < 3 or ycbcr.shape[-3] != 3:
+        raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {ycbcr.shape}")
+
+    y = ycbcr[..., 0, :, :]
+    cb = ycbcr[..., 1, :, :]
+    cr = ycbcr[..., 2, :, :]
+    r = y + 1.5748 * (cr - 0.5)
+    b = y + 1.8556 * (cb - 0.5)
+    g = (y - 0.2126 * r - 0.0722 * b) / 0.7152
+    return torch.stack([r, g, b], -3).clamp(0, 1)
+
+
 class RgbToYcbcr(nn.Module):
     r"""Convert an image from RGB to YCbCr.
 
@@ -473,4 +505,3 @@ def eval_quantize_per_tensor(t, bit=8):
     best_new_t = new_t_list[best_quant_idx]
 
     return best_quant_t, best_new_t             
-
