@@ -5,6 +5,7 @@ import math
 import os
 import random
 import shutil
+import sys
 import time
 from copy import deepcopy
 from datetime import datetime
@@ -24,10 +25,13 @@ from torchvision.utils import save_image
 
 from hnerv_utils import *
 from model_all import HNeRV, HNeRVDecoder, TransformInput, VideoDataSet
-from model_chroma_hnerv import ChromaHNeRV420A320, RGBSplitHNeRVA320
+from model_chroma_hnerv import ChromaHNeRV420, RGBSplitHNeRV
 
 
-CHROMA_EXPERIMENTS = ("rgb444_hnerv", "ycbcr444_hnerv", "rgbsplit_a320", "chroma420_a320")
+RGB_STYLE_EXPERIMENTS = ("rgb444_hnerv", "rgbsplit_a320", "rgbsplit_a160")
+CHROMA420_EXPERIMENTS = ("chroma420_a320", "chroma420_a160")
+SPLIT_EXPERIMENTS = ("rgbsplit_a320", "chroma420_a320", "rgbsplit_a160", "chroma420_a160")
+CHROMA_EXPERIMENTS = ("rgb444_hnerv", "ycbcr444_hnerv") + SPLIT_EXPERIMENTS
 METRIC_COLUMNS = [
     "params_M", "encoder_params_M", "decoder_params_M", "embed_params_M",
     "actual_total_params_M", "modelsize_target_M", "checkpoint_size_MB",
@@ -49,6 +53,8 @@ Sanity-check examples (small/debug only, not full experiments):
   python train_chroma_hnerv.py --data_path data/bunny --vid bunny --experiment ycbcr444_hnerv --modelsize 0.35 --enc_strds 5 4 4 2 2 --dec_strds 5 4 4 2 2 --ks 0_1_5 --crop_list 640_1280 --resize_list -1 --loss L2 -b 2 -e 1 --eval_freq 1 --debug
   python train_chroma_hnerv.py --data_path data/bunny --vid bunny --experiment rgbsplit_a320 --modelsize 0.35 --branch_width 8 --enc_strds 5 4 4 2 2 --dec_strds 5 4 4 2 2 --ks 0_1_5 --crop_list 640_1280 --resize_list -1 --loss L2 -b 2 -e 1 --eval_freq 1 --debug
   python train_chroma_hnerv.py --data_path data/bunny --vid bunny --experiment chroma420_a320 --modelsize 0.35 --branch_width 8 --lambda_rgb 0.1 --enc_strds 5 4 4 2 2 --dec_strds 5 4 4 2 2 --ks 0_1_5 --crop_list 640_1280 --resize_list -1 --loss L2 -b 2 -e 1 --eval_freq 1 --debug
+  python train_chroma_hnerv.py --data_path data/bunny --vid bunny --experiment rgbsplit_a160 --modelsize 0.35 --branch_width 8 --enc_strds 5 4 4 2 2 --dec_strds 5 4 4 2 2 --ks 0_1_5 --crop_list 640_1280 --resize_list -1 --loss L2 -b 2 -e 1 --eval_freq 1 --debug
+  python train_chroma_hnerv.py --data_path data/bunny --vid bunny --experiment chroma420_a160 --modelsize 0.35 --branch_width 8 --lambda_rgb 0.1 --enc_strds 5 4 4 2 2 --dec_strds 5 4 4 2 2 --ks 0_1_5 --crop_list 640_1280 --resize_list -1 --loss L2 -b 2 -e 1 --eval_freq 1 --debug
 """
     parser = argparse.ArgumentParser(
         description="Train RGB-HNeRV or full-resolution BT.709 YCbCr-HNeRV controls.",
@@ -116,7 +122,7 @@ Sanity-check examples (small/debug only, not full experiments):
     parser.add_argument("--lambda_y", default=1.0, type=float)
     parser.add_argument("--lambda_c", default=1.0, type=float)
     parser.add_argument("--lambda_rgb", default=0.0, type=float)
-    parser.add_argument("--split_stage", default="a320", choices=["a320"])
+    parser.add_argument("--split_stage", default="a320", choices=["a320", "a160"])
     parser.add_argument("--branch_width", default=8, type=int)
     parser.add_argument("--chroma_scale", default=2, type=int)
     parser.add_argument("--chroma_downsample", default="area", choices=["area"])
@@ -128,6 +134,7 @@ Sanity-check examples (small/debug only, not full experiments):
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    normalize_experiment_args(args)
     torch.set_printoptions(precision=4)
     setup_output_dir(args)
     port = hash(args.exp_id) % 20000 + 10000
@@ -139,6 +146,28 @@ def main():
         mp.spawn(train, nprocs=args.ngpus_per_node, args=(args,))
     else:
         train(None, args)
+
+
+def normalize_experiment_args(args):
+    lambda_rgb_was_explicit = any(arg == "--lambda_rgb" or arg.startswith("--lambda_rgb=") for arg in sys.argv[1:])
+    if args.experiment in CHROMA420_EXPERIMENTS and not lambda_rgb_was_explicit:
+        args.lambda_rgb = 0.1
+
+    expected_split = None
+    if args.experiment.endswith("_a320"):
+        expected_split = "a320"
+    elif args.experiment.endswith("_a160"):
+        expected_split = "a160"
+    if expected_split is None:
+        return
+
+    split_arg_was_explicit = any(arg == "--split_stage" or arg.startswith("--split_stage=") for arg in sys.argv[1:])
+    if split_arg_was_explicit and args.split_stage != expected_split:
+        raise ValueError(
+            f"{args.experiment} requires --split_stage {expected_split}, "
+            f"but got --split_stage {args.split_stage}."
+        )
+    args.split_stage = expected_split
 
 
 def setup_output_dir(args):
@@ -156,7 +185,7 @@ def setup_output_dir(args):
     args.quant_str = f"quant_M{args.quant_model_bit}_E{args.quant_embed_bit}"
     embed_str = f"{args.embed}_Dim{args.enc_dim}"
     run_prefix = f"{args.experiment}_" + (f"{args.run_name}_" if args.run_name else "")
-    split_str = f"_split{args.split_stage}_w{args.branch_width}" if args.experiment in ["rgbsplit_a320", "chroma420_a320"] else ""
+    split_str = f"_split{args.split_stage}_w{args.branch_width}" if args.experiment in SPLIT_EXPERIMENTS else ""
     args.exp_id = run_prefix + (
         f"{args.vid}/{args.data_split}_{embed_str}_FC{args.fc_hw}_KS{args.ks}_RED{args.reduce}"
         f"_low{args.lower_width}_blk{args.num_blks}_e{args.epochs}_b{args.batchSize}_{args.quant_str}"
@@ -177,6 +206,14 @@ def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
 
+def is_chroma420_experiment(args):
+    return args.experiment in CHROMA420_EXPERIMENTS
+
+
+def is_split_experiment(args):
+    return args.experiment in SPLIT_EXPERIMENTS
+
+
 def architecture_metadata(args):
     if args.experiment in ["rgb444_hnerv", "ycbcr444_hnerv"]:
         return {
@@ -187,22 +224,22 @@ def architecture_metadata(args):
             "chroma_scale": 1,
             "output_sample_ratio": 1.0,
         }
-    if args.experiment == "rgbsplit_a320":
+    if args.experiment.startswith("rgbsplit_"):
         return {
-            "architecture": "rgbsplit_a320",
+            "architecture": args.experiment,
             "chroma_format": "rgb444",
             "split_stage": args.split_stage,
             "branch_width": args.branch_width,
             "chroma_scale": 1,
             "output_sample_ratio": 1.0,
         }
-    if args.experiment == "chroma420_a320":
+    if is_chroma420_experiment(args):
         return {
-            "architecture": "chroma420_a320",
+            "architecture": args.experiment,
             "chroma_format": "420",
             "split_stage": args.split_stage,
             "branch_width": args.branch_width,
-            "chroma_scale": args.chroma_scale,
+            "chroma_scale": 2,
             "output_sample_ratio": 0.5,
         }
     raise ValueError(f"Unsupported experiment: {args.experiment}")
@@ -211,10 +248,10 @@ def architecture_metadata(args):
 def build_model(args):
     if args.experiment in ["rgb444_hnerv", "ycbcr444_hnerv"]:
         return HNeRV(args)
-    if args.experiment == "rgbsplit_a320":
-        return RGBSplitHNeRVA320(args)
-    if args.experiment == "chroma420_a320":
-        return ChromaHNeRV420A320(args)
+    if args.experiment.startswith("rgbsplit_"):
+        return RGBSplitHNeRV(args)
+    if is_chroma420_experiment(args):
+        return ChromaHNeRV420(args)
     raise ValueError(f"Unsupported experiment: {args.experiment}")
 
 
@@ -268,13 +305,13 @@ def attach_param_counts(args, model):
 
 
 def interpret_prediction(raw_output, args, aux=None):
-    if args.experiment in ["rgb444_hnerv", "rgbsplit_a320"]:
+    if args.experiment in RGB_STYLE_EXPERIMENTS:
         rgb = raw_output
         ycbcr = rgb_to_ycbcr_bt709(rgb)
     elif args.experiment == "ycbcr444_hnerv":
         ycbcr = raw_output
         rgb = ycbcr_to_rgb_bt709(ycbcr)
-    elif args.experiment == "chroma420_a320":
+    elif is_chroma420_experiment(args):
         rgb = aux["rgb"] if aux is not None and "rgb" in aux else raw_output
         ycbcr = aux["ycbcr"] if aux is not None and "ycbcr" in aux else rgb_to_ycbcr_bt709(rgb)
     else:
@@ -292,7 +329,7 @@ def area_downsample_chroma(chroma, scale):
 
 
 def compute_train_loss(raw_output, img_gt, inpaint_mask, args, aux=None):
-    if args.experiment in ["rgb444_hnerv", "rgbsplit_a320"]:
+    if args.experiment in RGB_STYLE_EXPERIMENTS:
         loss = loss_fn(raw_output * inpaint_mask, img_gt * inpaint_mask, args.loss)
         return loss, {"loss": loss.detach(), "loss_rgb": loss.detach()}
 
@@ -314,11 +351,11 @@ def compute_train_loss(raw_output, img_gt, inpaint_mask, args, aux=None):
             "loss_cr": loss_cr.detach(), "loss_c": loss_c.detach(), "loss_rgb": loss_rgb.detach(),
         }
 
-    if args.experiment == "chroma420_a320":
+    if is_chroma420_experiment(args):
         if "inpaint" in args.vid:
             raise NotImplementedError("Chroma420-HNeRV inpainting is not implemented in this first experiment.")
         if aux is None:
-            raise ValueError("chroma420_a320 training requires auxiliary model outputs.")
+            raise ValueError(f"{args.experiment} training requires auxiliary model outputs.")
         target_ycbcr = rgb_to_ycbcr_bt709(img_gt)
         target_y = target_ycbcr[:, 0:1]
         target_cbcr_low = area_downsample_chroma(target_ycbcr[:, 1:3], args.chroma_scale)
@@ -353,6 +390,25 @@ def safe_mean(values):
 def safe_std(values):
     vals = [float(v) for v in values if not math.isnan(float(v))]
     return float(np.std(vals)) if vals else float("nan")
+
+
+def tensor_min_max(tensor):
+    finite = tensor[torch.isfinite(tensor)]
+    if finite.numel() == 0:
+        return float("nan"), float("nan")
+    return finite.min().item(), finite.max().item()
+
+
+def assert_finite_tensor(tensor, name, context):
+    if torch.isfinite(tensor).all():
+        return
+    min_v, max_v = tensor_min_max(tensor.detach())
+    finite_count = torch.isfinite(tensor).sum().item()
+    total_count = tensor.numel()
+    raise FloatingPointError(
+        f"Non-finite tensor detected in {context}: {name}, "
+        f"finite={finite_count}/{total_count}, finite_min={min_v}, finite_max={max_v}"
+    )
 
 
 def safe_msssim(pred, target):
@@ -517,7 +573,7 @@ def train(local_rank, args):
             cur_input = norm_idx if "pe" in args.embed else img_data
             cur_epoch = (epoch + float(i) / len(train_dataloader)) / args.epochs
             lr = adjust_lr(optimizer, cur_epoch, args)
-            if args.experiment == "chroma420_a320":
+            if is_chroma420_experiment(args):
                 raw_output, _, _, aux = model(cur_input, return_aux=True)
             else:
                 raw_output, _, _ = model(cur_input)
@@ -651,7 +707,7 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
 
             fwd_start = time.time()
             input_embed = dequant_vid_embed[i] if model_ind else None
-            if args.experiment == "chroma420_a320":
+            if is_chroma420_experiment(args):
                 raw_output, embed_list, dec_time, aux = cur_model(cur_input, input_embed, return_aux=True)
             else:
                 raw_output, embed_list, dec_time = cur_model(cur_input, input_embed)
@@ -664,7 +720,7 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
                 img_embed_list.append(embed_list[0])
             if args.eval_fps:
                 for _ in range(100):
-                    if args.experiment == "chroma420_a320":
+                    if is_chroma420_experiment(args):
                         raw_output, embed_list, _, aux = cur_model(cur_input, embed_list[0], return_aux=True)
                     else:
                         raw_output, embed_list, _ = cur_model(cur_input, embed_list[0])
@@ -672,6 +728,9 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
             pred = interpret_prediction(raw_output, args, aux)
             pred_rgb = pred["rgb"].clamp(0, 1)
             pred_ycbcr = pred["ycbcr"].clamp(0, 1)
+            finite_context = f"experiment={args.experiment}, variant={variant}, batch={i}"
+            assert_finite_tensor(pred_rgb, "pred_rgb", finite_context)
+            assert_finite_tensor(pred_ycbcr, "pred_ycbcr", finite_context)
             gt_rgb = img_gt.clamp(0, 1)
             gt_ycbcr = rgb_to_ycbcr_bt709(gt_rgb).clamp(0, 1)
             end_time += time.time() - step_start
@@ -943,6 +1002,7 @@ def quant_model(model, args):
             encoder_k_list.append(k)
         else:
             quant_v, new_v = quant_tensor(v, args.quant_model_bit)
+            assert_finite_tensor(new_v, k, "quant_model dequantized parameter")
             quant_ckt[k] = quant_v
             cur_ckt[k] = new_v
     for encoder_k in encoder_k_list:

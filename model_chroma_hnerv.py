@@ -23,36 +23,56 @@ def _decoder_channels(args):
     return channels
 
 
-def _make_final_branch(args, in_channels, out_channels):
+def _split_config(args):
+    stage_count = len(args.dec_strds)
+    if args.split_stage == "a320":
+        shared_count = stage_count - 1
+        return {
+            "shared_count": shared_count,
+            "rgb_or_y_stage_indices": [stage_count - 1],
+            "cbcr_stage_indices": [],
+        }
+    if args.split_stage == "a160":
+        shared_count = stage_count - 2
+        return {
+            "shared_count": shared_count,
+            "rgb_or_y_stage_indices": [stage_count - 2, stage_count - 1],
+            "cbcr_stage_indices": [stage_count - 2],
+        }
+    raise NotImplementedError(f"Unsupported split stage: {args.split_stage}")
+
+
+def _make_branch(args, in_channels, out_channels, stage_indices):
     _, dec_blks = [int(x) for x in args.num_blks.split("_")]
-    final_stage_idx = len(args.dec_strds) - 1
-    final_stride = args.dec_strds[-1]
-    final_kernel = _branch_kernel(args, final_stage_idx)
     blocks = []
     cur_in = in_channels
-    for block_idx in range(dec_blks):
-        blocks.append(NeRVBlock(
-            dec_block=True,
-            conv_type=args.conv_type[1],
-            ngf=cur_in,
-            new_ngf=out_channels,
-            ks=final_kernel,
-            strd=final_stride if block_idx == 0 else 1,
-            bias=True,
-            norm=args.norm,
-            act=args.act,
-        ))
-        cur_in = out_channels
-    return nn.Sequential(*blocks)
+    for stage_idx in stage_indices:
+        stage_stride = args.dec_strds[stage_idx]
+        stage_kernel = _branch_kernel(args, stage_idx)
+        for block_idx in range(dec_blks):
+            blocks.append(NeRVBlock(
+                dec_block=True,
+                conv_type=args.conv_type[1],
+                ngf=cur_in,
+                new_ngf=out_channels,
+                ks=stage_kernel,
+                strd=stage_stride if block_idx == 0 else 1,
+                bias=True,
+                norm=args.norm,
+                act=args.act,
+            ))
+            cur_in = out_channels
+    return nn.Sequential(*blocks) if blocks else nn.Identity()
 
 
-class _A320Base(nn.Module):
+class _SplitBase(nn.Module):
     def __init__(self, args):
         super().__init__()
-        if args.split_stage != "a320":
-            raise NotImplementedError("Only --split_stage a320 is supported for Stage 2.")
-        if len(args.dec_strds) < 2:
-            raise ValueError("A320 split requires at least two decoder stages.")
+        split = _split_config(args)
+        if split["shared_count"] < 1:
+            raise ValueError(f"{args.split_stage} split leaves no shared upsample stages.")
+        if split["shared_count"] >= len(args.dec_strds):
+            raise ValueError(f"{args.split_stage} split leaves no branch stages.")
 
         base = HNeRV(args)
         self.embed = base.embed
@@ -61,12 +81,15 @@ class _A320Base(nn.Module):
             self.pe_embed = base.pe_embed
         self.fc_h, self.fc_w = base.fc_h, base.fc_w
         self.out_bias = base.out_bias
+        self.split_stage = args.split_stage
+        self.rgb_or_y_stage_indices = split["rgb_or_y_stage_indices"]
+        self.cbcr_stage_indices = split["cbcr_stage_indices"]
 
         _, dec_blks = [int(x) for x in args.num_blks.split("_")]
-        split_block_count = 1 + (len(args.dec_strds) - 1) * dec_blks
+        split_block_count = 1 + split["shared_count"] * dec_blks
         self.shared_decoder = nn.ModuleList(list(base.decoder[:split_block_count]))
         channel_schedule = _decoder_channels(args)
-        self.shared_channels = channel_schedule[-2]
+        self.shared_channels = channel_schedule[split["shared_count"] - 1]
 
     def _encode(self, input, input_embed=None):
         if input_embed is not None:
@@ -89,10 +112,11 @@ class _A320Base(nn.Module):
         return output, embed_list
 
 
-class RGBSplitHNeRVA320(_A320Base):
+class RGBSplitHNeRV(_SplitBase):
     def __init__(self, args):
         super().__init__(args)
-        self.rgb_branch = _make_final_branch(args, self.shared_channels, args.branch_width)
+        self.rgb_branch = _make_branch(
+            args, self.shared_channels, args.branch_width, self.rgb_or_y_stage_indices)
         self.rgb_head = nn.Conv2d(args.branch_width, 3, 3, 1, 1)
 
     def forward(self, input, input_embed=None, encode_only=False):
@@ -107,15 +131,19 @@ class RGBSplitHNeRVA320(_A320Base):
         return img_out, embed_list, dec_time
 
 
-class ChromaHNeRV420A320(_A320Base):
+class ChromaHNeRV420(_SplitBase):
     def __init__(self, args):
         super().__init__(args)
         if args.chroma_scale != 2:
-            raise NotImplementedError("Stage 2 chroma420_a320 only supports --chroma_scale 2.")
+            raise NotImplementedError("Chroma420 split models only support --chroma_scale 2.")
         self.chroma_upsample = args.chroma_upsample
-        self.y_branch = _make_final_branch(args, self.shared_channels, args.branch_width)
+        self.y_branch = _make_branch(
+            args, self.shared_channels, args.branch_width, self.rgb_or_y_stage_indices)
         self.y_head = nn.Conv2d(args.branch_width, 1, 3, 1, 1)
-        self.cbcr_head = nn.Conv2d(self.shared_channels, 2, 3, 1, 1)
+        self.cbcr_branch = _make_branch(
+            args, self.shared_channels, args.branch_width, self.cbcr_stage_indices)
+        cbcr_head_channels = args.branch_width if self.cbcr_stage_indices else self.shared_channels
+        self.cbcr_head = nn.Conv2d(cbcr_head_channels, 2, 3, 1, 1)
 
     def _upsample_cbcr(self, cbcr_low, target_hw):
         if self.chroma_upsample == "nearest":
@@ -128,9 +156,10 @@ class ChromaHNeRV420A320(_A320Base):
         dec_start = time.time()
         shared, embed_list = self._shared_forward(input, input_embed)
 
-        cbcr_low = OutImg(self.cbcr_head(shared), self.out_bias)
+        cbcr_feat = self.cbcr_branch(shared)
+        cbcr_low = OutImg(self.cbcr_head(cbcr_feat), self.out_bias)
         y_feat = self.y_branch(shared)
-        embed_list.append(y_feat)
+        embed_list.extend([cbcr_feat, y_feat])
         y = OutImg(self.y_head(y_feat), self.out_bias)
         cbcr_up = self._upsample_cbcr(cbcr_low, y.shape[-2:])
         ycbcr = torch.cat([y, cbcr_up], dim=1)
@@ -149,3 +178,19 @@ class ChromaHNeRV420A320(_A320Base):
             }
             return rgb, embed_list, dec_time, aux
         return rgb, embed_list, dec_time
+
+
+class RGBSplitHNeRVA320(RGBSplitHNeRV):
+    pass
+
+
+class ChromaHNeRV420A320(ChromaHNeRV420):
+    pass
+
+
+class RGBSplitHNeRVA160(RGBSplitHNeRV):
+    pass
+
+
+class ChromaHNeRV420A160(ChromaHNeRV420):
+    pass

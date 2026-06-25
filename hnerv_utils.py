@@ -23,16 +23,24 @@ def data_split(img_list, split_num_list, shuffle_data, rand_num=0):
     return temp_train_list, temp_val_list
 
 ################# Tensor quantization and dequantization #################
+def _safe_quant_scale(scale, eps=1e-12):
+    return torch.where(
+        torch.isfinite(scale) & (scale.abs() > eps),
+        scale,
+        torch.ones_like(scale),
+    )
+
+
 def quant_tensor(t, bits=8):
     tmin_scale_list = []
     # quantize over the whole tensor, or along each dimenstion
     t_min, t_max = t.min(), t.max()
-    scale = (t_max - t_min) / (2**bits-1)
+    scale = _safe_quant_scale((t_max - t_min) / (2**bits-1))
     tmin_scale_list.append([t_min, scale])
     for axis in range(t.dim()):
         t_min, t_max = t.min(axis, keepdim=True)[0], t.max(axis, keepdim=True)[0]
         if t_min.nelement() / t.nelement() < 0.02:
-            scale = (t_max - t_min) / (2**bits-1)
+            scale = _safe_quant_scale((t_max - t_min) / (2**bits-1))
             # tmin_scale_list.append([t_min, scale]) 
             tmin_scale_list.append([t_min.to(torch.float16), scale.to(torch.float16)]) 
     # import pdb; pdb.set_trace; from IPython import embed; embed() 
@@ -40,8 +48,10 @@ def quant_tensor(t, bits=8):
     quant_t_list, new_t_list, err_t_list = [], [], []
     for t_min, scale in tmin_scale_list:
         t_min, scale = t_min.expand_as(t), scale.expand_as(t)
-        quant_t = ((t - t_min) / (scale)).round().clamp(0, 2**bits-1)
+        scale = _safe_quant_scale(scale)
+        quant_t = ((t - t_min) / scale).round().clamp(0, 2**bits-1)
         new_t = t_min + scale * quant_t
+        new_t = torch.nan_to_num(new_t, nan=0.0, posinf=0.0, neginf=0.0)
         err_t = (t - new_t).abs().mean()
         quant_t_list.append(quant_t)
         new_t_list.append(new_t)
@@ -61,7 +71,9 @@ def quant_tensor(t, bits=8):
 
 def dequant_tensor(quant_t):
     quant_t, tmin, scale = quant_t['quant'], quant_t['min'], quant_t['scale']
-    new_t = tmin.expand_as(quant_t) + scale.expand_as(quant_t) * quant_t
+    scale = _safe_quant_scale(scale.expand_as(quant_t))
+    new_t = tmin.expand_as(quant_t) + scale * quant_t
+    new_t = torch.nan_to_num(new_t, nan=0.0, posinf=0.0, neginf=0.0)
     return new_t
 
 ################# Function used in distributed training #################
