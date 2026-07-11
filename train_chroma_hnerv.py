@@ -1,5 +1,6 @@
 import argparse
 import csv
+import io
 import imageio
 import math
 import os
@@ -43,6 +44,16 @@ METRIC_COLUMNS = [
     "ssim_y", "ssim_cb", "ssim_cr", "yuv_ssim_611", "lpips_alex",
     "frame_psnr_mean", "frame_psnr_std", "frame_y_psnr_mean",
     "frame_y_psnr_std", "temporal_rgb_error_diff",
+]
+SUPPORTED_QUANT_BITS = (2, 3, 4, 6, 8)
+STORAGE_FIELDS = [
+    "shared_param_count", "y_param_count", "chroma_param_count", "rgb_param_count",
+    "model_param_count", "quantized_param_count", "shared_payload_bits", "y_payload_bits",
+    "chroma_payload_bits", "rgb_payload_bits", "model_payload_bits", "embedding_payload_bits",
+    "scale_min_overhead_bits", "buffer_bits", "metadata_bits", "tensor_padding_bits",
+    "total_fixed_width_bits", "effective_bits_per_weight", "effective_bits_per_stored_value",
+    "fixed_width_bpp", "huffman_payload_bits", "huffman_overhead_bits", "huffman_total_bits",
+    "huffman_bpp", "packed_checkpoint_size_MB", "legacy_uint8_checkpoint_size_MB",
 ]
 
 
@@ -102,6 +113,14 @@ Sanity-check examples (small/debug only, not full experiments):
     parser.add_argument("--quant_model_bit", type=int, default=8, help="bit length for model quantization")
     parser.add_argument("--quant_embed_bit", type=int, default=6, help="bit length for embedding quantization")
     parser.add_argument("--quant_axis", type=int, default=0, help="quantization axis (-1 means per tensor)")
+    parser.add_argument("--quant_scheme", choices=["uniform", "component"], default="uniform")
+    parser.add_argument("--quant_shared_bit", type=int, default=-1)
+    parser.add_argument("--quant_y_bit", type=int, default=-1)
+    parser.add_argument("--quant_chroma_bit", type=int, default=-1)
+    parser.add_argument("--quant_rgb_bit", type=int, default=-1)
+    parser.add_argument("--quant_tag", type=str, default="")
+    parser.add_argument("--save_packed_quant", action="store_true")
+    parser.add_argument("--quant_storage_mode", choices=["packed", "uint8_legacy"], default="packed")
     parser.add_argument("--dump_images", action="store_true", default=False, help="dump prediction images")
     parser.add_argument("--dump_videos", action="store_true", default=False, help="concat predictions into video")
     parser.add_argument("--eval_fps", action="store_true", default=False, help="forward multiple times for fps")
@@ -152,6 +171,7 @@ def normalize_experiment_args(args):
     lambda_rgb_was_explicit = any(arg == "--lambda_rgb" or arg.startswith("--lambda_rgb=") for arg in sys.argv[1:])
     if args.experiment in CHROMA420_EXPERIMENTS and not lambda_rgb_was_explicit:
         args.lambda_rgb = 0.1
+    validate_quant_args(args)
 
     expected_split = None
     if args.experiment.endswith("_a320"):
@@ -170,6 +190,28 @@ def normalize_experiment_args(args):
     args.split_stage = expected_split
 
 
+def validate_quant_args(args):
+    if args.quant_axis < -2:
+        raise ValueError("--quant_axis must be -2 (automatic), -1 (per tensor), or a tensor axis.")
+    for name in ["quant_model_bit", "quant_embed_bit", "quant_shared_bit", "quant_y_bit",
+                 "quant_chroma_bit", "quant_rgb_bit"]:
+        value = getattr(args, name)
+        if value != -1 and value not in SUPPORTED_QUANT_BITS:
+            raise ValueError(f"--{name} must be -1 or one of {SUPPORTED_QUANT_BITS}, got {value}.")
+    if args.quant_embed_bit == -1 and (args.quant_scheme == "component" or args.quant_model_bit != -1):
+        raise ValueError("--quant_embed_bit cannot be -1 when model PTQ is enabled.")
+    if args.quant_scheme == "uniform":
+        return
+    if args.experiment in ("rgb444_hnerv", "ycbcr444_hnerv"):
+        raise ValueError("Component quantization is unsupported for full HNeRV; use --quant_scheme uniform.")
+    required = ["quant_shared_bit"]
+    required += ["quant_rgb_bit"] if args.experiment.startswith("rgbsplit_") else ["quant_y_bit", "quant_chroma_bit"]
+    for name in required:
+        value = getattr(args, name)
+        if value not in SUPPORTED_QUANT_BITS:
+            raise ValueError(f"Component mode requires --{name} in {SUPPORTED_QUANT_BITS}, got {value}.")
+
+
 def setup_output_dir(args):
     if args.debug:
         args.eval_freq = 1
@@ -182,7 +224,16 @@ def setup_output_dir(args):
         args.modelsize, args.conv_type[0], args.enc_strd_str, args.conv_type[1],
         args.dec_strd_str, "" if args.norm == "none" else f"_{args.norm}",
         "_dist" if args.distributed else "", "_shuffle_data" if args.shuffle_data else "")
-    args.quant_str = f"quant_M{args.quant_model_bit}_E{args.quant_embed_bit}"
+    if args.quant_scheme == "uniform":
+        args.quant_str = f"uniform_M{args.quant_model_bit}_E{args.quant_embed_bit}"
+    elif args.experiment.startswith("rgbsplit_"):
+        args.quant_str = f"component_S{args.quant_shared_bit}_RGB{args.quant_rgb_bit}_E{args.quant_embed_bit}"
+    else:
+        args.quant_str = (
+            f"component_S{args.quant_shared_bit}_Y{args.quant_y_bit}"
+            f"_C{args.quant_chroma_bit}_E{args.quant_embed_bit}")
+    if args.quant_tag:
+        args.quant_str += f"_{args.quant_tag}"
     embed_str = f"{args.embed}_Dim{args.enc_dim}"
     run_prefix = f"{args.experiment}_" + (f"{args.run_name}_" if args.run_name else "")
     split_str = f"_split{args.split_stage}_w{args.branch_width}" if args.experiment in SPLIT_EXPERIMENTS else ""
@@ -212,6 +263,10 @@ def is_chroma420_experiment(args):
 
 def is_split_experiment(args):
     return args.experiment in SPLIT_EXPERIMENTS
+
+
+def quantization_enabled(args):
+    return args.quant_scheme == "component" or args.quant_model_bit != -1
 
 
 def architecture_metadata(args):
@@ -675,7 +730,7 @@ def load_checkpoint_if_needed(model, optimizer, args, local_rank):
 @torch.no_grad()
 def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_coding=False):
     img_embed_list = []
-    model_list, quant_ckt = quant_model(model, args)
+    model_list, quant_ckt, quant_report = quant_model(model, args)
     metrics_by_variant = {}
     dequant_vid_embed = None
     quant_embed = None
@@ -779,9 +834,9 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
         metrics["end_to_end_fps"] = frame_count / max(end_time, 1e-12) if frame_count else float("nan")
         metrics_by_variant[variant] = metrics
 
-        if model_ind == 0 and args.quant_model_bit != -1:
+        if model_ind == 0 and quantization_enabled(args):
             vid_embed = torch.cat(img_embed_list, 0)
-            quant_embed, dequant_embed = quant_tensor(vid_embed, args.quant_embed_bit)
+            quant_embed, dequant_embed = quant_tensor(vid_embed, args.quant_embed_bit, args.quant_axis)
             dequant_vid_embed = dequant_embed.split(args.batchSize, dim=0)
 
         if dump_vis and args.dump_videos:
@@ -794,19 +849,34 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
                 shutil.rmtree(visual_dir)
 
     if local_rank in [0, None] and quant_ckt is not None and quant_embed is not None:
-        quant_vid = {"embed": quant_embed, "model": quant_ckt}
-        torch.save(quant_vid, f"{args.outf}/quant_vid.pth")
+        finalize_storage_report(args, quant_report, quant_embed, quant_ckt, huffman_coding)
+        packed_embed = serialize_quant_tensor(quant_embed)
+        packed_model = {key: serialize_quant_tensor(value) for key, value in quant_ckt.items()}
+        common = {
+            "format_version": 2,
+            "quant_config": quant_config(args),
+            "buffers": quant_report["buffers"],
+            "storage_report": quant_report["storage"],
+        }
+        packed_vid = dict(common, embed=packed_embed, model=packed_model)
+        legacy_vid = dict(common, embed=quant_embed, model=quant_ckt)
+        packed_stream, legacy_stream = io.BytesIO(), io.BytesIO()
+        torch.save(packed_vid, packed_stream)
+        torch.save(legacy_vid, legacy_stream)
+        args.packed_checkpoint_size_MB = packed_stream.tell() / (1024 ** 2)
+        args.legacy_uint8_checkpoint_size_MB = legacy_stream.tell() / (1024 ** 2)
+        quant_report["storage"]["packed_checkpoint_size_MB"] = args.packed_checkpoint_size_MB
+        quant_report["storage"]["legacy_uint8_checkpoint_size_MB"] = args.legacy_uint8_checkpoint_size_MB
+        quant_vid = packed_vid if args.quant_storage_mode == "packed" else legacy_vid
+        quant_path = f"{args.outf}/quant_vid.pth"
+        torch.save(quant_vid, quant_path)
         base_model = unwrap_model(model)
         if isinstance(base_model, HNeRV):
             torch.jit.save(torch.jit.trace(HNeRVDecoder(base_model), (vid_embed[:2])), f"{args.outf}/img_decoder.pth")
         else:
             print("Skipping TorchScript decoder export for split ChromaHNeRV model.", flush=True)
-        if huffman_coding:
-            attach_huffman_bpp(args, quant_embed, quant_ckt)
-            if "orig" in metrics_by_variant:
-                update_quant_fields(metrics_by_variant["orig"], args)
-            if "quant" in metrics_by_variant:
-                update_quant_fields(metrics_by_variant["quant"], args)
+        for metrics in metrics_by_variant.values():
+            update_quant_fields(metrics, args)
 
     h, w = img_data.shape[-2:]
     return metrics_by_variant, (h, w)
@@ -900,28 +970,66 @@ def update_quant_fields(metrics, args):
     metrics["bits_per_param"] = getattr(args, "bits_per_param", float("nan"))
     metrics["bits_per_param_with_overhead"] = getattr(args, "full_bits_per_param", float("nan"))
     metrics["bits_per_pixel"] = getattr(args, "total_bpp", float("nan"))
+    for field in STORAGE_FIELDS:
+        metrics[field] = getattr(args, field, float("nan"))
 
 
-def attach_huffman_bpp(args, quant_embed, quant_ckt):
-    quant_v_list = quant_embed["quant"].flatten().tolist()
-    tmin_scale_len = quant_embed["min"].nelement() + quant_embed["scale"].nelement()
-    for _, layer_wt in quant_ckt.items():
-        quant_v_list.extend(layer_wt["quant"].flatten().tolist())
-        tmin_scale_len += layer_wt["min"].nelement() + layer_wt["scale"].nelement()
+def huffman_payload_bits(records):
+    by_group = {}
+    for group, record in records:
+        by_group.setdefault((group, int(record["bits"])), []).extend(record["quant"].flatten().tolist())
+    payload, metadata = 0, 0
+    for symbols in by_group.values():
+        if not symbols:
+            continue
+        codec = HuffmanCodec.from_data(symbols)
+        table = codec.get_code_table()
+        lengths = {symbol: code[0] for symbol, code in table.items()}
+        unique, counts = np.unique(symbols, return_counts=True)
+        payload += sum(int(count) * lengths[int(symbol)] for symbol, count in zip(unique, counts))
+        metadata += len(table) * 16 + 64  # Explicitly an estimated codebook/group header.
+    return payload, metadata
 
-    unique, counts = np.unique(quant_v_list, return_counts=True)
-    num_freq = dict(zip(unique, counts))
-    codec = HuffmanCodec.from_data(quant_v_list)
-    sym_bit_dict = {k: v[0] for k, v in codec.get_code_table().items()}
-    total_bits = sum(freq * sym_bit_dict[num] for num, freq in num_freq.items())
-    args.bits_per_param = total_bits / len(quant_v_list)
-    total_bits += tmin_scale_len * 16
-    args.full_bits_per_param = total_bits / len(quant_v_list)
-    args.total_bpp = total_bits / args.final_size / args.full_data_length
-    print(
-        "After quantization and encoding: \n"
-        f" bits per parameter: {round(args.full_bits_per_param, 2)}, bits per pixel: {round(args.total_bpp, 4)}",
-        flush=True)
+
+def finalize_storage_report(args, report, quant_embed, quant_ckt, include_huffman):
+    storage = report["storage"]
+    storage["embedding_payload_bits"] = quant_embed["numel"] * quant_embed["bits"]
+    embed_packed_bits = pack_nbit_tensor(quant_embed["quant"], quant_embed["bits"]).numel() * 8
+    storage["tensor_padding_bits"] += embed_packed_bits - storage["embedding_payload_bits"]
+    storage["scale_min_overhead_bits"] += (
+        quant_embed["min"].numel() + quant_embed["scale"].numel()) * 16
+    storage["metadata_bits"] += quant_tensor_metadata_bits(quant_embed)
+    payload = sum(storage[f"{group}_payload_bits"] for group in ["shared", "y", "chroma", "rgb", "model"])
+    packed_payload = payload + storage["embedding_payload_bits"] + storage["tensor_padding_bits"]
+    total = packed_payload + storage["scale_min_overhead_bits"] + storage["buffer_bits"] + storage["metadata_bits"]
+    storage["total_fixed_width_bits"] = total
+    storage["quantized_param_count"] = sum(storage[f"{group}_param_count"] for group in ["shared", "y", "chroma", "rgb", "model"])
+    stored_values = storage["quantized_param_count"] + quant_embed["numel"]
+    storage["effective_bits_per_weight"] = total / max(storage["quantized_param_count"], 1)
+    storage["effective_bits_per_stored_value"] = total / max(stored_values, 1)
+    storage["fixed_width_bpp"] = total / args.final_size / args.full_data_length
+    legacy = {
+        "format_version": 2, "quant_config": quant_config(args), "embed": quant_embed,
+        "model": quant_ckt, "buffers": report["buffers"], "storage_report": storage,
+    }
+    stream = io.BytesIO()
+    torch.save(legacy, stream)
+    storage["legacy_uint8_checkpoint_size_MB"] = stream.tell() / (1024 ** 2)
+    if include_huffman:
+        records = [(report["parameter_groups"][name], record) for name, record in quant_ckt.items()]
+        records.append(("embedding", quant_embed))
+        huff_payload, codec_estimate = huffman_payload_bits(records)
+        huff_overhead = storage["scale_min_overhead_bits"] + storage["buffer_bits"] + storage["metadata_bits"] + codec_estimate
+        storage["huffman_payload_bits"] = huff_payload
+        storage["huffman_overhead_bits"] = huff_overhead
+        storage["huffman_total_bits"] = huff_payload + huff_overhead
+        storage["huffman_bpp"] = storage["huffman_total_bits"] / args.final_size / args.full_data_length
+    args.bits_per_param = payload / max(storage["quantized_param_count"], 1)
+    args.full_bits_per_param = storage["effective_bits_per_weight"]
+    args.total_bpp = storage["fixed_width_bpp"]
+    for key, value in storage.items():
+        setattr(args, key, value)
+    print_quant_report(report, args)
 
 
 def dump_csv(args, metrics_by_variant, filename="results.csv"):
@@ -940,8 +1048,10 @@ def append_consolidated_csv(args, metrics_by_variant):
 
 def build_result_row(args, metrics_by_variant):
     arch_meta = architecture_metadata(args)
+    effective_bits = effective_quant_bits(args)
     row = {
         "run_name": args.run_name,
+        "checkpoint_path": args.weight,
         "experiment": args.experiment,
         "architecture": arch_meta["architecture"],
         "chroma_format": arch_meta["chroma_format"],
@@ -969,47 +1079,211 @@ def build_result_row(args, metrics_by_variant):
         "manualSeed": args.manualSeed,
         "cur_epoch": getattr(args, "cur_epoch", ""),
         "train_time": getattr(args, "train_time", ""),
+        "quant_configuration": args.quant_str,
+        "quant_scheme": args.quant_scheme,
+        "quant_tag": args.quant_tag,
+        "quant_shared_bit": effective_bits["shared"],
+        "quant_y_bit": effective_bits["y"],
+        "quant_chroma_bit": effective_bits["chroma"],
+        "quant_rgb_bit": effective_bits["rgb"],
+        "quant_model_bit": args.quant_model_bit,
+        "quant_embed_bit": args.quant_embed_bit,
     }
+    for field in STORAGE_FIELDS:
+        row[field] = getattr(args, field, float("nan"))
     orig = metrics_by_variant.get("orig", {})
     for col in METRIC_COLUMNS:
         row[col] = orig.get(col, float("nan"))
     quant = metrics_by_variant.get("quant", {})
     for col in METRIC_COLUMNS:
         row[f"quant_{col}"] = quant.get(col, float("nan"))
+    delta_map = {
+        "rgb_psnr": "rgb_psnr", "y_psnr": "psnr_y", "cb_psnr": "psnr_cb",
+        "cr_psnr": "psnr_cr", "yuv_psnr": "yuv_psnr_611_mse",
+        "ms_ssim": "rgb_ms_ssim", "yuv_ssim": "yuv_ssim_611", "lpips": "lpips_alex",
+    }
+    for output_name, metric_name in delta_map.items():
+        row[f"quant_{output_name}_delta"] = quant.get(metric_name, float("nan")) - orig.get(metric_name, float("nan"))
     return row
 
 
 def write_csv_row(path, row, append):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     file_exists = os.path.isfile(path)
+    if append and file_exists:
+        with open(path, newline="") as existing_file:
+            reader = csv.DictReader(existing_file)
+            old_rows = list(reader)
+            old_fields = reader.fieldnames or []
+        new_fields = old_fields + [field for field in row if field not in old_fields]
+        if new_fields != old_fields:
+            with open(path, "w", newline="") as expanded_file:
+                writer = csv.DictWriter(expanded_file, fieldnames=new_fields)
+                writer.writeheader()
+                writer.writerows(old_rows)
     mode = "a" if append else "w"
     with open(path, mode, newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if append and file_exists:
+            fieldnames = new_fields
+        else:
+            fieldnames = list(row.keys())
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if (not append) or (not file_exists):
             writer.writeheader()
         writer.writerow(row)
 
 
+def _strip_module_prefix(name):
+    return name[7:] if name.startswith("module.") else name
+
+
+def classify_quant_group(model, parameter_name, args):
+    name = _strip_module_prefix(parameter_name)
+    if name.startswith("encoder."):
+        return "encoder"
+    base_model = unwrap_model(model)
+    if isinstance(base_model, ChromaHNeRV420):
+        prefixes = {
+            "shared_decoder.": "shared", "y_branch.": "y", "y_head.": "y",
+            "cbcr_branch.": "chroma", "cbcr_head.": "chroma",
+        }
+    elif isinstance(base_model, RGBSplitHNeRV):
+        prefixes = {"shared_decoder.": "shared", "rgb_branch.": "rgb", "rgb_head.": "rgb"}
+    elif isinstance(base_model, HNeRV):
+        prefixes = {"decoder.": "model", "head_layer.": "model"}
+    else:
+        raise TypeError(f"Unsupported quantized model type: {type(base_model).__name__}")
+    matches = [group for prefix, group in prefixes.items() if name.startswith(prefix)]
+    if len(matches) != 1:
+        raise ValueError(f"Parameter '{parameter_name}' does not match exactly one quantization group.")
+    return matches[0]
+
+
+def resolve_group_bit(group, args):
+    if args.quant_scheme == "uniform":
+        return args.quant_model_bit
+    mapping = {
+        "shared": args.quant_shared_bit, "y": args.quant_y_bit,
+        "chroma": args.quant_chroma_bit, "rgb": args.quant_rgb_bit,
+    }
+    if group not in mapping or mapping[group] not in SUPPORTED_QUANT_BITS:
+        raise ValueError(f"No valid component bitwidth assigned to quantization group '{group}'.")
+    return mapping[group]
+
+
+def quant_config(args):
+    effective = effective_quant_bits(args)
+    return {
+        "scheme": args.quant_scheme, "tag": args.quant_tag, "quant_axis": args.quant_axis,
+        "model_bit": args.quant_model_bit, "embed_bit": args.quant_embed_bit,
+        "shared_bit": effective["shared"], "y_bit": effective["y"],
+        "chroma_bit": effective["chroma"], "rgb_bit": effective["rgb"],
+        "storage_mode": args.quant_storage_mode,
+    }
+
+
+def effective_quant_bits(args):
+    bits = {
+        "shared": args.quant_shared_bit, "y": args.quant_y_bit,
+        "chroma": args.quant_chroma_bit, "rgb": args.quant_rgb_bit,
+    }
+    if args.quant_scheme == "uniform":
+        if args.experiment.startswith("rgbsplit_"):
+            bits.update(shared=args.quant_model_bit, rgb=args.quant_model_bit)
+        elif args.experiment.startswith("chroma420_"):
+            bits.update(shared=args.quant_model_bit, y=args.quant_model_bit, chroma=args.quant_model_bit)
+    return bits
+
+
+def quant_tensor_metadata_bits(record):
+    return 8 + 16 + 64 + 32 * len(record["shape"])
+
+
+def empty_storage_report():
+    report = {field: 0 for field in STORAGE_FIELDS}
+    for field in ["huffman_payload_bits", "huffman_overhead_bits", "huffman_total_bits", "huffman_bpp",
+                  "packed_checkpoint_size_MB", "legacy_uint8_checkpoint_size_MB"]:
+        report[field] = float("nan")
+    return report
+
+
+def print_quant_report(report, args):
+    storage = report["storage"]
+    total_payload = sum(storage[f"{g}_payload_bits"] for g in ["shared", "y", "chroma", "rgb", "model"])
+    print("Quantization group report:", flush=True)
+    for group in ["shared", "y", "chroma", "rgb", "model"]:
+        count = storage[f"{group}_param_count"]
+        if not count:
+            continue
+        bits = report["group_bits"][group]
+        pct = 100 * storage[f"{group}_payload_bits"] / max(total_payload, 1)
+        tensors = report["group_tensor_counts"][group]
+        print(f"  {group}: tensors={tensors}, parameters={count}, bits={bits}, "
+              f"payload={storage[f'{group}_payload_bits']}, stored_weight_pct={pct:.2f}%", flush=True)
+    print(f"  fixed_width_bpp={storage['fixed_width_bpp']:.6f}, "
+          f"total_fixed_width_bits={storage['total_fixed_width_bits']}", flush=True)
+
+
 def quant_model(model, args):
     model_list = [deepcopy(model)]
-    if args.quant_model_bit == -1:
-        return model_list, None
+    if args.quant_model_bit == -1 and args.quant_scheme == "uniform":
+        return model_list, None, None
     cur_model = deepcopy(model)
-    quant_ckt, cur_ckt = [cur_model.state_dict() for _ in range(2)]
-    encoder_k_list = []
-    for k, v in cur_ckt.items():
-        if "encoder" in k:
-            encoder_k_list.append(k)
+    cur_state = cur_model.state_dict()
+    quant_ckt, parameter_groups = {}, {}
+    group_counts = {group: 0 for group in ["shared", "y", "chroma", "rgb", "model"]}
+    group_tensors = {group: 0 for group in group_counts}
+    group_bits = {}
+
+    named_parameters = dict(cur_model.named_parameters())
+    non_encoder_count = 0
+    for name, parameter in named_parameters.items():
+        group = classify_quant_group(cur_model, name, args)
+        if group == "encoder":
+            continue
+        bits = resolve_group_bit(group, args)
+        record, dequantized = quant_tensor(parameter.detach(), bits, args.quant_axis)
+        assert_finite_tensor(dequantized, name, "quant_model dequantized parameter")
+        cur_state[name] = dequantized.to(parameter.dtype)
+        quant_ckt[name] = record
+        parameter_groups[name] = group
+        group_counts[group] += parameter.numel()
+        group_tensors[group] += 1
+        group_bits[group] = bits
+        non_encoder_count += parameter.numel()
+
+    if sum(group_counts.values()) != non_encoder_count:
+        raise RuntimeError("Quantization group parameter counts do not cover all non-encoder parameters.")
+
+    buffers = {}
+    for name, buffer in cur_model.named_buffers():
+        if _strip_module_prefix(name).startswith("encoder."):
+            continue
+        if torch.is_floating_point(buffer):
+            buffers[name] = buffer.detach().to(torch.float16).cpu()
+            cur_state[name] = buffers[name].to(buffer.device, buffer.dtype)
         else:
-            quant_v, new_v = quant_tensor(v, args.quant_model_bit)
-            assert_finite_tensor(new_v, k, "quant_model dequantized parameter")
-            quant_ckt[k] = quant_v
-            cur_ckt[k] = new_v
-    for encoder_k in encoder_k_list:
-        del quant_ckt[encoder_k]
-    cur_model.load_state_dict(cur_ckt)
+            buffers[name] = buffer.detach().cpu()
+    cur_model.load_state_dict(cur_state)
     model_list.append(cur_model)
-    return model_list, quant_ckt
+
+    storage = empty_storage_report()
+    for group, count in group_counts.items():
+        storage[f"{group}_param_count"] = count
+        storage[f"{group}_payload_bits"] = count * group_bits.get(group, 0)
+    for record in quant_ckt.values():
+        packed_bits = pack_nbit_tensor(record["quant"], record["bits"]).numel() * 8
+        storage["tensor_padding_bits"] += packed_bits - record["numel"] * record["bits"]
+        storage["scale_min_overhead_bits"] += (record["min"].numel() + record["scale"].numel()) * 16
+        storage["metadata_bits"] += quant_tensor_metadata_bits(record)
+    storage["buffer_bits"] = sum(buffer.numel() * (16 if torch.is_floating_point(buffer) else buffer.element_size() * 8)
+                                 for buffer in buffers.values())
+    storage["metadata_bits"] += sum(64 + 32 * buffer.dim() for buffer in buffers.values())
+    report = {
+        "storage": storage, "buffers": buffers, "parameter_groups": parameter_groups,
+        "group_tensor_counts": group_tensors, "group_bits": group_bits,
+    }
+    return model_list, quant_ckt, report
 
 
 if __name__ == "__main__":

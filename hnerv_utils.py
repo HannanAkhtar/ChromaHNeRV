@@ -31,48 +31,118 @@ def _safe_quant_scale(scale, eps=1e-12):
     )
 
 
-def quant_tensor(t, bits=8):
-    tmin_scale_list = []
-    # quantize over the whole tensor, or along each dimenstion
-    t_min, t_max = t.min(), t.max()
-    scale = _safe_quant_scale((t_max - t_min) / (2**bits-1))
-    tmin_scale_list.append([t_min, scale])
-    for axis in range(t.dim()):
-        t_min, t_max = t.min(axis, keepdim=True)[0], t.max(axis, keepdim=True)[0]
-        if t_min.nelement() / t.nelement() < 0.02:
-            scale = _safe_quant_scale((t_max - t_min) / (2**bits-1))
-            # tmin_scale_list.append([t_min, scale]) 
-            tmin_scale_list.append([t_min.to(torch.float16), scale.to(torch.float16)]) 
-    # import pdb; pdb.set_trace; from IPython import embed; embed() 
-     
-    quant_t_list, new_t_list, err_t_list = [], [], []
-    for t_min, scale in tmin_scale_list:
-        t_min, scale = t_min.expand_as(t), scale.expand_as(t)
-        scale = _safe_quant_scale(scale)
-        quant_t = ((t - t_min) / scale).round().clamp(0, 2**bits-1)
-        new_t = t_min + scale * quant_t
-        new_t = torch.nan_to_num(new_t, nan=0.0, posinf=0.0, neginf=0.0)
-        err_t = (t - new_t).abs().mean()
-        quant_t_list.append(quant_t)
-        new_t_list.append(new_t)
-        err_t_list.append(err_t)   
-
-    # choose the best quantization 
-    best_err_t = min(err_t_list)
-    best_quant_idx = err_t_list.index(best_err_t)
-    best_new_t = new_t_list[best_quant_idx]
-    best_quant_t = quant_t_list[best_quant_idx].to(torch.uint8)
-    best_tmin = tmin_scale_list[best_quant_idx][0]
-    best_scale = tmin_scale_list[best_quant_idx][1]
-    quant_t = {'quant': best_quant_t, 'min': best_tmin, 'scale': best_scale}
-
-    return quant_t, best_new_t             
+def _quant_min_scale(t, bits, quant_axis):
+    if quant_axis == -1 or t.dim() == 0:
+        t_min, t_max = t.min(), t.max()
+    else:
+        if not 0 <= quant_axis < t.dim():
+            raise ValueError(f"quant_axis must be -2, -1, or a tensor axis, got {quant_axis}.")
+        reduce_dims = tuple(dim for dim in range(t.dim()) if dim != quant_axis)
+        if not reduce_dims:
+            t_min, t_max = t, t
+        else:
+            t_min = t.amin(dim=reduce_dims, keepdim=True)
+            t_max = t.amax(dim=reduce_dims, keepdim=True)
+    return t_min, _safe_quant_scale((t_max - t_min) / (2**bits - 1))
 
 
-def dequant_tensor(quant_t):
-    quant_t, tmin, scale = quant_t['quant'], quant_t['min'], quant_t['scale']
-    scale = _safe_quant_scale(scale.expand_as(quant_t))
-    new_t = tmin.expand_as(quant_t) + scale * quant_t
+def quant_tensor(t, bits=8, quant_axis=0):
+    if bits not in range(1, 9):
+        raise ValueError(f"Quantization supports 1 through 8 bits, got {bits}.")
+    if not torch.is_floating_point(t):
+        raise TypeError(f"quant_tensor requires a floating tensor, got {t.dtype}.")
+    if not torch.isfinite(t).all():
+        raise ValueError("Cannot quantize a tensor containing NaN or Inf.")
+
+    candidate_axes = [-1]
+    if quant_axis == -2:
+        candidate_axes.extend(range(t.dim()))
+    else:
+        candidate_axes = [quant_axis]
+
+    candidates = []
+    for axis in candidate_axes:
+        t_min, scale = _quant_min_scale(t, bits, axis)
+        quant = ((t - t_min) / scale).round().clamp(0, 2**bits - 1).to(torch.uint8)
+        dequant = t_min + scale * quant.to(t.dtype)
+        dequant = torch.nan_to_num(dequant, nan=0.0, posinf=0.0, neginf=0.0)
+        candidates.append(((t - dequant).abs().mean().item(), axis, t_min, scale, quant, dequant))
+
+    _, axis, t_min, scale, quant, dequant = min(candidates, key=lambda item: item[0])
+    record = {
+        "quant": quant,
+        "min": t_min.to(torch.float16),
+        "scale": scale.to(torch.float16),
+        "bits": int(bits),
+        "shape": tuple(t.shape),
+        "numel": t.numel(),
+        "quant_axis": int(axis),
+    }
+    # Evaluate the exact FP16 min/scale representation that will be serialized.
+    return record, dequant_tensor(record).to(t.dtype)
+
+
+def pack_nbit_tensor(values, bits):
+    if bits not in range(1, 9):
+        raise ValueError(f"Packing supports 1 through 8 bits, got {bits}.")
+    values = values.detach().to(device="cpu", dtype=torch.int64).flatten()
+    if values.numel() and ((values < 0).any() or (values > 2**bits - 1).any()):
+        raise ValueError(f"Symbols must lie in [0, {2**bits - 1}] for {bits}-bit packing.")
+    if not values.numel():
+        return torch.empty(0, dtype=torch.uint8)
+    shifts = torch.arange(bits, dtype=torch.int64)
+    bitstream = ((values[:, None] >> shifts) & 1).flatten()
+    padding = (-bitstream.numel()) % 8
+    if padding:
+        bitstream = F.pad(bitstream, (0, padding))
+    byte_weights = (1 << torch.arange(8, dtype=torch.int64))
+    return (bitstream.reshape(-1, 8) * byte_weights).sum(1).to(torch.uint8)
+
+
+def unpack_nbit_tensor(packed, bits, numel, shape):
+    if bits not in range(1, 9):
+        raise ValueError(f"Unpacking supports 1 through 8 bits, got {bits}.")
+    expected_bytes = math.ceil(int(numel) * bits / 8)
+    packed = packed.detach().to(device="cpu", dtype=torch.uint8).flatten()
+    if packed.numel() != expected_bytes:
+        raise ValueError(f"Packed tensor has {packed.numel()} bytes; expected {expected_bytes}.")
+    if int(numel) == 0:
+        return torch.empty(tuple(shape), dtype=torch.uint8)
+    shifts = torch.arange(8, dtype=torch.int64)
+    bitstream = ((packed.to(torch.int64)[:, None] >> shifts) & 1).flatten()[:int(numel) * bits]
+    symbol_weights = (1 << torch.arange(bits, dtype=torch.int64))
+    values = (bitstream.reshape(int(numel), bits) * symbol_weights).sum(1)
+    return values.to(torch.uint8).reshape(tuple(shape))
+
+
+def serialize_quant_tensor(record):
+    required = {"quant", "min", "scale", "bits", "shape", "numel", "quant_axis"}
+    missing = required.difference(record)
+    if missing:
+        raise KeyError(f"Quantized tensor record is missing: {sorted(missing)}")
+    return {
+        "packed": pack_nbit_tensor(record["quant"], int(record["bits"])),
+        "bits": int(record["bits"]),
+        "shape": tuple(record["shape"]),
+        "numel": int(record["numel"]),
+        "min": record["min"].to(torch.float16).cpu(),
+        "scale": record["scale"].to(torch.float16).cpu(),
+        "quant_axis": int(record["quant_axis"]),
+    }
+
+
+def dequant_tensor(record):
+    if "quant" in record:
+        quant = record["quant"]
+    elif "packed" in record:
+        quant = unpack_nbit_tensor(
+            record["packed"], int(record["bits"]), int(record["numel"]), record["shape"])
+        quant = quant.to(record["min"].device)
+    else:
+        raise KeyError("Quantized tensor record must contain either 'quant' or 'packed'.")
+    tmin, scale = record["min"].to(torch.float32), record["scale"].to(torch.float32)
+    scale = _safe_quant_scale(scale.expand_as(quant))
+    new_t = tmin.expand_as(quant) + scale * quant.to(torch.float32)
     new_t = torch.nan_to_num(new_t, nan=0.0, posinf=0.0, neginf=0.0)
     return new_t
 

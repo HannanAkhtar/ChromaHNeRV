@@ -8,11 +8,22 @@ import pandas as pd
 import numpy as np
 from torchvision.utils import save_image
 from torchvision.io import write_video
+from hnerv_utils import dequant_tensor
 
-def dequant_tensor(quant_t):
-    quant_t, tmin, scale = quant_t['quant'], quant_t['min'].to(torch.float32), quant_t['scale'].to(torch.float32)
-    new_t = tmin.expand_as(quant_t) + scale.expand_as(quant_t) * quant_t
-    return new_t
+
+def load_quantized_video_checkpoint(path):
+    checkpoint = torch.load(path, map_location='cpu')
+    version = checkpoint.get('format_version', 1)
+    if version not in (1, 2):
+        raise ValueError(
+            f"Unsupported quantized checkpoint format_version={version}; supported versions are 1 and 2.")
+    if 'embed' not in checkpoint or 'model' not in checkpoint:
+        raise ValueError("Quantized checkpoint must contain 'embed' and 'model' records.")
+    embedding = dequant_tensor(checkpoint['embed'])
+    model_state = {key: dequant_tensor(record) for key, record in checkpoint['model'].items()}
+    if version == 2:
+        model_state.update(checkpoint.get('buffers', {}))
+    return embedding, model_state, checkpoint
 
 def main():
     parser = argparse.ArgumentParser()
@@ -28,9 +39,9 @@ def main():
 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     # Load video checkpoints and dequant them
-    quant_ckt = torch.load(args.ckt, map_location='cpu')
-    vid_embed = dequant_tensor(quant_ckt['embed']).to(device)
-    dequant_ckt = {k:dequant_tensor(v).to(device) for k,v in quant_ckt['model'].items()}
+    vid_embed, dequant_ckt, _ = load_quantized_video_checkpoint(args.ckt)
+    vid_embed = vid_embed.to(device)
+    dequant_ckt = {key: value.to(device) for key, value in dequant_ckt.items()}
     img_decoder = torch.jit.load(args.decoder, map_location='cpu').to(device)
     img_decoder.load_state_dict(dequant_ckt)
 
