@@ -1,26 +1,17 @@
 import time
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from hnerv_utils import ycbcr_to_rgb_bt709
-from model_all import HNeRV, NeRVBlock, OutImg
+from model_all import HNeRV, NeRVBlock, OutImg, decoder_channel_schedule
 
 
 def _branch_kernel(args, stage_idx):
     _, ks_dec1, ks_dec2 = [int(x) for x in args.ks.split("_")]
     return min(ks_dec1 + 2 * stage_idx, ks_dec2)
-
-
-def _decoder_channels(args):
-    channels = []
-    ngf = args.fc_dim
-    for strd in args.dec_strds:
-        reduction = strd ** 0.5 if args.reduce == -1 else args.reduce
-        ngf = int(max(round(ngf / reduction), args.lower_width))
-        channels.append(ngf)
-    return channels
 
 
 def _split_config(args):
@@ -42,7 +33,7 @@ def _split_config(args):
     raise NotImplementedError(f"Unsupported split stage: {args.split_stage}")
 
 
-def _make_branch(args, in_channels, out_channels, stage_indices):
+def _make_fixed_branch(args, in_channels, out_channels, stage_indices):
     _, dec_blks = [int(x) for x in args.num_blks.split("_")]
     blocks = []
     cur_in = in_channels
@@ -65,6 +56,52 @@ def _make_branch(args, in_channels, out_channels, stage_indices):
     return nn.Sequential(*blocks) if blocks else nn.Identity()
 
 
+def _stage_module_slice(decoder, args, stage_indices):
+    if not stage_indices:
+        return []
+    _, dec_blks = [int(x) for x in args.num_blks.split("_")]
+    modules = []
+    for stage_idx in stage_indices:
+        start = 1 + stage_idx * dec_blks
+        modules.extend(decoder[start:start + dec_blks])
+    return modules
+
+
+def convert_full_state_dict_to_native_rgbsplit(state_dict, dec_strds, num_blks, split_stage):
+    """Convert Full HNeRV state keys into the structurally equivalent native RGBSplit layout."""
+    stage_count = len(dec_strds)
+    shared_count = stage_count - (1 if split_stage == "a320" else 2 if split_stage == "a160" else 0)
+    if shared_count <= 0 or shared_count >= stage_count:
+        raise ValueError(f"Unsupported or invalid split stage: {split_stage}")
+    _, dec_blks = [int(x) for x in num_blks.split("_")]
+    split_block_count = 1 + shared_count * dec_blks
+    converted = {}
+    for raw_name, value in state_dict.items():
+        name = raw_name[7:] if raw_name.startswith("module.") else raw_name
+        if name.startswith("blocks.0."):
+            name = name[len("blocks.0."):]
+        if name.startswith("decoder."):
+            parts = name.split(".", 2)
+            block_index = int(parts[1])
+            suffix = parts[2] if len(parts) == 3 else ""
+            if block_index < split_block_count:
+                new_name = f"shared_decoder.{block_index}"
+            else:
+                new_name = f"rgb_branch.{block_index - split_block_count}"
+            converted[f"{new_name}.{suffix}" if suffix else new_name] = value
+        elif name.startswith("head_layer."):
+            converted[name.replace("head_layer.", "rgb_head.", 1)] = value
+        else:
+            converted[name] = value
+    if not any(name.startswith("shared_decoder.") for name in converted):
+        raise ValueError("Full HNeRV state dict contains no decoder parameters.")
+    if not any(name.startswith("rgb_branch.") for name in converted):
+        raise ValueError("Split conversion produced no RGB branch parameters.")
+    if "rgb_head.weight" not in converted:
+        raise ValueError("Full HNeRV state dict is missing head_layer.weight.")
+    return converted
+
+
 class _SplitBase(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -82,14 +119,29 @@ class _SplitBase(nn.Module):
         self.fc_h, self.fc_w = base.fc_h, base.fc_w
         self.out_bias = base.out_bias
         self.split_stage = args.split_stage
+        self.branch_width_mode = getattr(args, "branch_width_mode", "fixed")
         self.rgb_or_y_stage_indices = split["rgb_or_y_stage_indices"]
         self.cbcr_stage_indices = split["cbcr_stage_indices"]
 
         _, dec_blks = [int(x) for x in args.num_blks.split("_")]
         split_block_count = 1 + split["shared_count"] * dec_blks
         self.shared_decoder = nn.ModuleList(list(base.decoder[:split_block_count]))
-        channel_schedule = _decoder_channels(args)
+        channel_schedule = decoder_channel_schedule(args)
+        self.native_channel_schedule = tuple(channel_schedule)
         self.shared_channels = channel_schedule[split["shared_count"] - 1]
+        self.shared_channel_schedule = tuple(channel_schedule[:split["shared_count"]])
+        object.__setattr__(self, "_base_decoder_ref", base.decoder)
+
+    def _make_branch(self, args, stage_indices):
+        if self.branch_width_mode == "native":
+            modules = _stage_module_slice(self._base_decoder_ref, args, stage_indices)
+            return nn.Sequential(*modules) if modules else nn.Identity()
+        return _make_fixed_branch(args, self.shared_channels, args.branch_width, stage_indices)
+
+    def _branch_schedule(self, args, stage_indices):
+        if self.branch_width_mode == "native":
+            return tuple(self.native_channel_schedule[index] for index in stage_indices)
+        return tuple(args.branch_width for _ in stage_indices)
 
     def _encode(self, input, input_embed=None):
         if input_embed is not None:
@@ -115,9 +167,11 @@ class _SplitBase(nn.Module):
 class RGBSplitHNeRV(_SplitBase):
     def __init__(self, args):
         super().__init__(args)
-        self.rgb_branch = _make_branch(
-            args, self.shared_channels, args.branch_width, self.rgb_or_y_stage_indices)
-        self.rgb_head = nn.Conv2d(args.branch_width, 3, 3, 1, 1)
+        self.rgb_branch = self._make_branch(args, self.rgb_or_y_stage_indices)
+        self.rgb_branch_channels = self._branch_schedule(args, self.rgb_or_y_stage_indices)
+        head_channels = self.rgb_branch_channels[-1]
+        self.rgb_head = nn.Conv2d(head_channels, 3, 3, 1, 1)
+        object.__delattr__(self, "_base_decoder_ref")
 
     def forward(self, input, input_embed=None, encode_only=False):
         dec_start = time.time()
@@ -137,13 +191,18 @@ class ChromaHNeRV420(_SplitBase):
         if args.chroma_scale != 2:
             raise NotImplementedError("Chroma420 split models only support --chroma_scale 2.")
         self.chroma_upsample = args.chroma_upsample
-        self.y_branch = _make_branch(
-            args, self.shared_channels, args.branch_width, self.rgb_or_y_stage_indices)
-        self.y_head = nn.Conv2d(args.branch_width, 1, 3, 1, 1)
-        self.cbcr_branch = _make_branch(
-            args, self.shared_channels, args.branch_width, self.cbcr_stage_indices)
-        cbcr_head_channels = args.branch_width if self.cbcr_stage_indices else self.shared_channels
+        self.y_branch = self._make_branch(args, self.rgb_or_y_stage_indices)
+        self.y_branch_channels = self._branch_schedule(args, self.rgb_or_y_stage_indices)
+        self.y_head = nn.Conv2d(self.y_branch_channels[-1], 1, 3, 1, 1)
+        if self.branch_width_mode == "native":
+            cbcr_modules = deepcopy(_stage_module_slice(self._base_decoder_ref, args, self.cbcr_stage_indices))
+            self.cbcr_branch = nn.Sequential(*cbcr_modules) if cbcr_modules else nn.Identity()
+        else:
+            self.cbcr_branch = self._make_branch(args, self.cbcr_stage_indices)
+        self.chroma_branch_channels = self._branch_schedule(args, self.cbcr_stage_indices)
+        cbcr_head_channels = self.chroma_branch_channels[-1] if self.chroma_branch_channels else self.shared_channels
         self.cbcr_head = nn.Conv2d(cbcr_head_channels, 2, 3, 1, 1)
+        object.__delattr__(self, "_base_decoder_ref")
 
     def _upsample_cbcr(self, cbcr_low, target_hw):
         if self.chroma_upsample == "nearest":

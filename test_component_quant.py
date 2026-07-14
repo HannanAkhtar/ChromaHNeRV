@@ -1,18 +1,21 @@
 from argparse import Namespace
+import os
+import tempfile
 
 import torch
 import torch.nn as nn
 
 from hnerv_utils import dequant_tensor, pack_nbit_tensor, quant_tensor, serialize_quant_tensor, unpack_nbit_tensor
 from model_all import HNeRV
+from efficient_nvloader import load_quantized_video_checkpoint
 from model_chroma_hnerv import ChromaHNeRV420, RGBSplitHNeRV
 from train_chroma_hnerv import classify_quant_group, quant_model
 
 
 def test_pack_roundtrip():
     torch.manual_seed(3)
-    for bits in (2, 3, 4, 6, 8):
-        for shape in ((1,), (7,), (3, 5), (2, 3, 7)):
+    for bits in range(2, 9):
+        for shape in ((1,), (7,), (9,), (3, 5), (2, 3, 7)):
             values = torch.randint(0, 2**bits, shape, dtype=torch.uint8)
             packed = pack_nbit_tensor(values, bits)
             restored = unpack_nbit_tensor(packed, bits, values.numel(), values.shape)
@@ -21,15 +24,48 @@ def test_pack_roundtrip():
 
 def test_quantization_roundtrip():
     torch.manual_seed(4)
-    for bits in (2, 3, 4, 6, 8):
-        for tensor in (torch.randn(5, 7), torch.full((3, 5), 2.25)):
-            record, dequantized = quant_tensor(tensor, bits, quant_axis=0)
-            assert torch.isfinite(dequantized).all()
-            assert record["quant"].max().item() <= 2**bits - 1
-            packed_record = serialize_quant_tensor(record)
-            packed_dequantized = dequant_tensor(packed_record)
-            assert packed_dequantized.shape == tensor.shape
-            assert torch.equal(dequant_tensor(record), packed_dequantized)
+    for bits in range(2, 9):
+        for axis in (-1, 0):
+            for tensor in (torch.randn(5, 7) * 3 - 1, torch.full((3, 5), -2.25)):
+                record, dequantized = quant_tensor(tensor, bits, quant_axis=axis)
+                assert torch.isfinite(dequantized).all()
+                assert record["quant"].min().item() >= 0
+                assert record["quant"].max().item() <= 2**bits - 1
+                assert record["numel"] * bits == tensor.numel() * bits
+                packed_record = serialize_quant_tensor(record)
+                assert packed_record["packed"].numel() == (tensor.numel() * bits + 7) // 8
+                packed_dequantized = dequant_tensor(packed_record)
+                assert packed_dequantized.shape == tensor.shape
+                assert torch.equal(dequant_tensor(record), packed_dequantized)
+
+
+def test_packed_checkpoint_loading_all_bits():
+    with tempfile.TemporaryDirectory() as directory:
+        for bits in range(2, 9):
+            embed, _ = quant_tensor(torch.randn(5, 3), bits, -1)
+            weight, _ = quant_tensor(torch.randn(7, 5), bits, 0)
+            checkpoint = {
+                "format_version": 2,
+                "quant_config": {"model_bit": bits, "embed_bit": bits},
+                "embed": serialize_quant_tensor(embed),
+                "model": {"decoder.weight": serialize_quant_tensor(weight)},
+                "buffers": {},
+                "storage_report": {},
+            }
+            path = os.path.join(directory, f"quant_{bits}.pth")
+            torch.save(checkpoint, path)
+            loaded_embed, loaded_model, _ = load_quantized_video_checkpoint(path)
+            assert torch.equal(loaded_embed, dequant_tensor(embed))
+            assert torch.equal(loaded_model["decoder.weight"], dequant_tensor(weight))
+
+        legacy_embed, _ = quant_tensor(torch.randn(5, 3), 8, -1)
+        legacy_weight, _ = quant_tensor(torch.randn(7, 5), 8, 0)
+        legacy_path = os.path.join(directory, "legacy_quant_vid.pth")
+        torch.save({"embed": legacy_embed, "model": {"decoder.weight": legacy_weight}}, legacy_path)
+        loaded_embed, loaded_model, loaded = load_quantized_video_checkpoint(legacy_path)
+        assert loaded.get("format_version", 1) == 1
+        assert torch.equal(loaded_embed, dequant_tensor(legacy_embed))
+        assert torch.equal(loaded_model["decoder.weight"], dequant_tensor(legacy_weight))
 
 
 def _model_shell(model_type, groups):
@@ -98,6 +134,7 @@ def test_uniform_regression_and_storage():
 if __name__ == "__main__":
     test_pack_roundtrip()
     test_quantization_roundtrip()
+    test_packed_checkpoint_loading_all_bits()
     test_group_classification()
     test_uniform_regression_and_storage()
     print("component quantization tests passed")

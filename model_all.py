@@ -98,6 +98,17 @@ def OutImg(x, out_bias='tanh'):
         return x + float(out_bias)
 
 
+def decoder_channel_schedule(args):
+    """Return the native output width of every decoder upsampling stage."""
+    channels = []
+    ngf = args.fc_dim
+    for strd in args.dec_strds:
+        reduction = sqrt(strd) if args.reduce == -1 else args.reduce
+        ngf = int(max(round(ngf / reduction), args.lower_width))
+        channels.append(ngf)
+    return channels
+
+
 class HNeRV(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -136,9 +147,8 @@ class HNeRV(nn.Module):
         decoder_layer1 = NeRVBlock(dec_block=False, conv_type='conv', ngf=ch_in, new_ngf=out_f, ks=0, strd=1, 
             bias=True, norm=args.norm, act=args.act)
         decoder_layers.append(decoder_layer1)
-        for i, strd in enumerate(args.dec_strds):                         
-            reduction = sqrt(strd) if args.reduce==-1 else args.reduce
-            new_ngf = int(max(round(ngf / reduction), args.lower_width))
+        native_channels = decoder_channel_schedule(args)
+        for i, (strd, new_ngf) in enumerate(zip(args.dec_strds, native_channels)):
             for j in range(dec_blks):
                 cur_blk = NeRVBlock(dec_block=True, conv_type=args.conv_type[1], ngf=ngf, new_ngf=new_ngf, 
                     ks=min(ks_dec1+2*i, ks_dec2), strd=1 if j else strd, bias=True, norm=args.norm, act=args.act)

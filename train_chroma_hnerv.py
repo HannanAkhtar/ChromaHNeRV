@@ -25,7 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
 
 from hnerv_utils import *
-from model_all import HNeRV, HNeRVDecoder, TransformInput, VideoDataSet
+from model_all import HNeRV, HNeRVDecoder, TransformInput, VideoDataSet, decoder_channel_schedule
 from model_chroma_hnerv import ChromaHNeRV420, RGBSplitHNeRV
 
 
@@ -45,7 +45,7 @@ METRIC_COLUMNS = [
     "frame_psnr_mean", "frame_psnr_std", "frame_y_psnr_mean",
     "frame_y_psnr_std", "temporal_rgb_error_diff",
 ]
-SUPPORTED_QUANT_BITS = (2, 3, 4, 6, 8)
+SUPPORTED_QUANT_BITS = tuple(range(2, 9))
 STORAGE_FIELDS = [
     "shared_param_count", "y_param_count", "chroma_param_count", "rgb_param_count",
     "model_param_count", "quantized_param_count", "shared_payload_bits", "y_payload_bits",
@@ -54,6 +54,8 @@ STORAGE_FIELDS = [
     "total_fixed_width_bits", "effective_bits_per_weight", "effective_bits_per_stored_value",
     "fixed_width_bpp", "huffman_payload_bits", "huffman_overhead_bits", "huffman_total_bits",
     "huffman_bpp", "packed_checkpoint_size_MB", "legacy_uint8_checkpoint_size_MB",
+    "fixed_width_weight_bits", "fixed_width_total_bits", "packed_checkpoint_bytes",
+    "effective_bits_per_playback_weight", "embedding_bits",
 ]
 
 
@@ -119,6 +121,8 @@ Sanity-check examples (small/debug only, not full experiments):
     parser.add_argument("--quant_chroma_bit", type=int, default=-1)
     parser.add_argument("--quant_rgb_bit", type=int, default=-1)
     parser.add_argument("--quant_tag", type=str, default="")
+    parser.add_argument("--quant_matrix", type=str, default="")
+    parser.add_argument("--rd_curve", type=str, default="")
     parser.add_argument("--save_packed_quant", action="store_true")
     parser.add_argument("--quant_storage_mode", choices=["packed", "uint8_legacy"], default="packed")
     parser.add_argument("--dump_images", action="store_true", default=False, help="dump prediction images")
@@ -143,6 +147,7 @@ Sanity-check examples (small/debug only, not full experiments):
     parser.add_argument("--lambda_rgb", default=0.0, type=float)
     parser.add_argument("--split_stage", default="a320", choices=["a320", "a160"])
     parser.add_argument("--branch_width", default=8, type=int)
+    parser.add_argument("--branch_width_mode", default="fixed", choices=["fixed", "native"])
     parser.add_argument("--chroma_scale", default=2, type=int)
     parser.add_argument("--chroma_downsample", default="area", choices=["area"])
     parser.add_argument("--chroma_upsample", default="bilinear", choices=["bilinear", "nearest"])
@@ -171,6 +176,11 @@ def normalize_experiment_args(args):
     lambda_rgb_was_explicit = any(arg == "--lambda_rgb" or arg.startswith("--lambda_rgb=") for arg in sys.argv[1:])
     if args.experiment in CHROMA420_EXPERIMENTS and not lambda_rgb_was_explicit:
         args.lambda_rgb = 0.1
+    branch_width_explicit = any(arg == "--branch_width" or arg.startswith("--branch_width=") for arg in sys.argv[1:])
+    if args.branch_width_mode == "native" and branch_width_explicit:
+        raise ValueError("--branch_width must not be supplied with --branch_width_mode native.")
+    if args.branch_width_mode == "native" and args.experiment not in SPLIT_EXPERIMENTS:
+        raise ValueError("--branch_width_mode native is only valid for RGBSplit and Chroma420 models.")
     validate_quant_args(args)
 
     expected_split = None
@@ -236,7 +246,11 @@ def setup_output_dir(args):
         args.quant_str += f"_{args.quant_tag}"
     embed_str = f"{args.embed}_Dim{args.enc_dim}"
     run_prefix = f"{args.experiment}_" + (f"{args.run_name}_" if args.run_name else "")
-    split_str = f"_split{args.split_stage}_w{args.branch_width}" if args.experiment in SPLIT_EXPERIMENTS else ""
+    if args.experiment in SPLIT_EXPERIMENTS:
+        split_str = (f"_split{args.split_stage}_native" if args.branch_width_mode == "native"
+                     else f"_split{args.split_stage}_w{args.branch_width}")
+    else:
+        split_str = ""
     args.exp_id = run_prefix + (
         f"{args.vid}/{args.data_split}_{embed_str}_FC{args.fc_hw}_KS{args.ks}_RED{args.reduce}"
         f"_low{args.lower_width}_blk{args.num_blks}_e{args.epochs}_b{args.batchSize}_{args.quant_str}"
@@ -276,6 +290,7 @@ def architecture_metadata(args):
             "chroma_format": "444",
             "split_stage": "none",
             "branch_width": float("nan"),
+            "branch_width_mode": "none",
             "chroma_scale": 1,
             "output_sample_ratio": 1.0,
         }
@@ -284,7 +299,8 @@ def architecture_metadata(args):
             "architecture": args.experiment,
             "chroma_format": "rgb444",
             "split_stage": args.split_stage,
-            "branch_width": args.branch_width,
+            "branch_width": float("nan") if args.branch_width_mode == "native" else args.branch_width,
+            "branch_width_mode": args.branch_width_mode,
             "chroma_scale": 1,
             "output_sample_ratio": 1.0,
         }
@@ -293,7 +309,8 @@ def architecture_metadata(args):
             "architecture": args.experiment,
             "chroma_format": "420",
             "split_stage": args.split_stage,
-            "branch_width": args.branch_width,
+            "branch_width": float("nan") if args.branch_width_mode == "native" else args.branch_width,
+            "branch_width_mode": args.branch_width_mode,
             "chroma_scale": 2,
             "output_sample_ratio": 0.5,
         }
@@ -357,6 +374,31 @@ def attach_param_counts(args, model):
     args.encoder_param = args.encoder_params_M
     args.decoder_param = args.decoder_params_M
     args.total_param = args.params_M
+    args.actual_total_params = encoder_params + decoder_params + int(round(args.embed_params_M * 1e6))
+    args.decoder_playback_params = decoder_params
+
+    groups = {"shared": 0, "rgb": 0, "y": 0, "chroma": 0, "model": 0}
+    for name, param in base.named_parameters():
+        if name.startswith("shared_decoder."):
+            groups["shared"] += param.numel()
+        elif name.startswith(("rgb_branch.", "rgb_head.")):
+            groups["rgb"] += param.numel()
+        elif name.startswith(("y_branch.", "y_head.")):
+            groups["y"] += param.numel()
+        elif name.startswith(("cbcr_branch.", "cbcr_head.")):
+            groups["chroma"] += param.numel()
+        elif name.startswith(("decoder.", "head_layer.")):
+            groups["model"] += param.numel()
+    for group, count in groups.items():
+        setattr(args, f"architecture_{group}_param_count", count)
+        setattr(args, f"architecture_{group}_param_percent", 100 * count / max(decoder_params, 1))
+
+    native_schedule = tuple(decoder_channel_schedule(args))
+    args.native_channel_schedule = ",".join(map(str, native_schedule))
+    args.shared_channels = ",".join(map(str, getattr(base, "shared_channel_schedule", ())))
+    args.rgb_branch_channels = ",".join(map(str, getattr(base, "rgb_branch_channels", ())))
+    args.y_branch_channels = ",".join(map(str, getattr(base, "y_branch_channels", ())))
+    args.chroma_branch_channels = ",".join(map(str, getattr(base, "chroma_branch_channels", ())))
 
 
 def interpret_prediction(raw_output, args, aux=None):
@@ -680,7 +722,26 @@ def train(local_rank, args):
                 with open(f"{args.outf}/rank0.txt", "a") as f:
                     f.write(print_str + "\n")
 
-        save_checkpoint = {"epoch": epoch + 1, "state_dict": model.state_dict(), "optimizer": optimizer.state_dict()}
+        save_checkpoint = {
+            "epoch": epoch + 1,
+            "state_dict": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "architecture_config": {
+                "experiment": args.experiment,
+                "modelsize": args.modelsize,
+                "split_stage": args.split_stage if args.experiment in SPLIT_EXPERIMENTS else None,
+                "branch_width_mode": args.branch_width_mode if args.experiment in SPLIT_EXPERIMENTS else None,
+                "branch_width": (args.branch_width if args.experiment in SPLIT_EXPERIMENTS
+                                 and args.branch_width_mode == "fixed" else None),
+                "fc_dim": args.fc_dim,
+                "dec_strds": list(args.dec_strds),
+                "native_channel_schedule": getattr(args, "native_channel_schedule", ""),
+                "shared_channels": getattr(args, "shared_channels", ""),
+                "rgb_branch_channels": getattr(args, "rgb_branch_channels", ""),
+                "y_branch_channels": getattr(args, "y_branch_channels", ""),
+                "chroma_branch_channels": getattr(args, "chroma_branch_channels", ""),
+            },
+        }
         if local_rank in [0, None]:
             torch.save(save_checkpoint, f"{args.outf}/model_latest.pth")
             if epoch + 1 == args.epochs:
@@ -704,14 +765,13 @@ def load_checkpoint_if_needed(model, optimizer, args, local_rank):
         print(f"=> loading checkpoint '{args.weight}'")
         checkpoint = torch.load(args.weight, map_location="cpu")
         orig_ckt = checkpoint["state_dict"]
-        new_ckt = {k.replace("blocks.0.", ""): v for k, v in orig_ckt.items()}
-        if "module" in list(orig_ckt.keys())[0] and not hasattr(model, "module"):
-            new_ckt = {k.replace("module.", ""): v for k, v in new_ckt.items()}
-            model.load_state_dict(new_ckt, strict=False)
-        elif "module" not in list(orig_ckt.keys())[0] and hasattr(model, "module"):
-            model.module.load_state_dict(new_ckt, strict=False)
-        else:
-            model.load_state_dict(new_ckt, strict=False)
+        new_ckt = {}
+        for key, value in orig_ckt.items():
+            name = key[7:] if key.startswith("module.") else key
+            if name.startswith("blocks.0."):
+                name = name[len("blocks.0."):]
+            new_ckt[name] = value
+        unwrap_model(model).load_state_dict(new_ckt, strict=True)
         print(f"=> loaded checkpoint '{args.weight}' (epoch {checkpoint['epoch']})")
 
     if not args.not_resume:
@@ -860,13 +920,16 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
         }
         packed_vid = dict(common, embed=packed_embed, model=packed_model)
         legacy_vid = dict(common, embed=quant_embed, model=quant_ckt)
-        packed_stream, legacy_stream = io.BytesIO(), io.BytesIO()
-        torch.save(packed_vid, packed_stream)
-        torch.save(legacy_vid, legacy_stream)
-        args.packed_checkpoint_size_MB = packed_stream.tell() / (1024 ** 2)
-        args.legacy_uint8_checkpoint_size_MB = legacy_stream.tell() / (1024 ** 2)
-        quant_report["storage"]["packed_checkpoint_size_MB"] = args.packed_checkpoint_size_MB
-        quant_report["storage"]["legacy_uint8_checkpoint_size_MB"] = args.legacy_uint8_checkpoint_size_MB
+        for _ in range(3):
+            packed_stream, legacy_stream = io.BytesIO(), io.BytesIO()
+            torch.save(packed_vid, packed_stream)
+            torch.save(legacy_vid, legacy_stream)
+            quant_report["storage"]["packed_checkpoint_bytes"] = packed_stream.tell()
+            quant_report["storage"]["packed_checkpoint_size_MB"] = packed_stream.tell() / (1024 ** 2)
+            quant_report["storage"]["legacy_uint8_checkpoint_size_MB"] = legacy_stream.tell() / (1024 ** 2)
+        args.packed_checkpoint_bytes = quant_report["storage"]["packed_checkpoint_bytes"]
+        args.packed_checkpoint_size_MB = quant_report["storage"]["packed_checkpoint_size_MB"]
+        args.legacy_uint8_checkpoint_size_MB = quant_report["storage"]["legacy_uint8_checkpoint_size_MB"]
         quant_vid = packed_vid if args.quant_storage_mode == "packed" else legacy_vid
         quant_path = f"{args.outf}/quant_vid.pth"
         torch.save(quant_vid, quant_path)
@@ -1008,6 +1071,10 @@ def finalize_storage_report(args, report, quant_embed, quant_ckt, include_huffma
     storage["effective_bits_per_weight"] = total / max(storage["quantized_param_count"], 1)
     storage["effective_bits_per_stored_value"] = total / max(stored_values, 1)
     storage["fixed_width_bpp"] = total / args.final_size / args.full_data_length
+    storage["fixed_width_weight_bits"] = payload
+    storage["fixed_width_total_bits"] = total
+    storage["effective_bits_per_playback_weight"] = total / max(storage["quantized_param_count"], 1)
+    storage["embedding_bits"] = storage["embedding_payload_bits"]
     legacy = {
         "format_version": 2, "quant_config": quant_config(args), "embed": quant_embed,
         "model": quant_ckt, "buffers": report["buffers"], "storage_report": storage,
@@ -1057,6 +1124,7 @@ def build_result_row(args, metrics_by_variant):
         "chroma_format": arch_meta["chroma_format"],
         "split_stage": arch_meta["split_stage"],
         "branch_width": arch_meta["branch_width"],
+        "branch_width_mode": arch_meta["branch_width_mode"],
         "chroma_scale": arch_meta["chroma_scale"],
         "chroma_downsample": args.chroma_downsample,
         "chroma_upsample": args.chroma_upsample,
@@ -1082,13 +1150,30 @@ def build_result_row(args, metrics_by_variant):
         "quant_configuration": args.quant_str,
         "quant_scheme": args.quant_scheme,
         "quant_tag": args.quant_tag,
+        "quant_matrix": args.quant_matrix,
+        "rd_curve": args.rd_curve,
         "quant_shared_bit": effective_bits["shared"],
         "quant_y_bit": effective_bits["y"],
         "quant_chroma_bit": effective_bits["chroma"],
         "quant_rgb_bit": effective_bits["rgb"],
         "quant_model_bit": args.quant_model_bit,
         "quant_embed_bit": args.quant_embed_bit,
+        "actual_total_params": getattr(args, "actual_total_params", float("nan")),
+        "decoder_playback_params": getattr(args, "decoder_playback_params", float("nan")),
+        "embedding_payload_values": int(round(getattr(args, "embed_params_M", 0) * 1e6)),
+        "native_channel_schedule": getattr(args, "native_channel_schedule", ""),
+        "shared_channels": getattr(args, "shared_channels", ""),
+        "rgb_branch_channels": getattr(args, "rgb_branch_channels", ""),
+        "y_branch_channels": getattr(args, "y_branch_channels", ""),
+        "chroma_branch_channels": getattr(args, "chroma_branch_channels", ""),
+        "rgb_or_y_output_resolution": args.crop_list,
+        "chroma_output_resolution": (
+            "_".join(str(int(value) // args.chroma_scale) for value in args.crop_list.split("_"))
+            if is_chroma420_experiment(args) else args.crop_list),
     }
+    for group in ["shared", "rgb", "y", "chroma", "model"]:
+        row[f"architecture_{group}_param_count"] = getattr(args, f"architecture_{group}_param_count", 0)
+        row[f"architecture_{group}_param_percent"] = getattr(args, f"architecture_{group}_param_percent", 0.0)
     for field in STORAGE_FIELDS:
         row[field] = getattr(args, field, float("nan"))
     orig = metrics_by_variant.get("orig", {})
