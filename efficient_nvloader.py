@@ -1,13 +1,9 @@
-import torch
-import os
-import shutil
-from tqdm import tqdm
 import argparse
-import time
-import pandas as pd
+import os
+
 import numpy as np
-from torchvision.utils import save_image
-from torchvision.io import write_video
+import torch
+
 from hnerv_utils import dequant_tensor
 
 
@@ -26,6 +22,9 @@ def load_quantized_video_checkpoint(path):
     return embedding, model_state, checkpoint
 
 def main():
+    import imageio.v2 as imageio
+    from torchvision.utils import save_image
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--decoder', type=str, default='checkpoints/img_decoder.pth', help='path for video decoder',)
     parser.add_argument('--ckt', type=str, default='checkpoints/quant_vid.pth', help='path for video checkpoint',) #
@@ -52,7 +51,9 @@ def main():
 
     # Dump video and frames
     out_vid = os.path.join(args.dump_dir, 'nvloader_out.mp4')
-    write_video(out_vid, img_out.permute(0,2,3,1) * 255., fps=args.frames/4, options={'crf':'10'})
+    video_frames = (
+        img_out.clamp(0, 1).permute(0, 2, 3, 1).mul(255).round().to(torch.uint8).numpy())
+    imageio.mimsave(out_vid, video_frames, fps=args.frames / 4, codec='libx264', quality=10)
     for idx in range(args.frames):
         out_img = os.path.join(args.dump_dir, f'frame{idx}_out.png')
         save_image(img_out[idx], out_img)
