@@ -44,13 +44,15 @@ Each sequence-size pair trains ten configurations: Full RGB, Full YCbCr444, and 
 For a modern Python and RTX 4500 Ada environment:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+conda create -n chromahnerv python=3.12
+conda activate chromahnerv
 python -m pip install --upgrade pip
 python -m pip install -r requirements_modern.txt
 ```
 
 `torch==2.5.1` and `torchvision==0.20.1` are a matched pair. Install them through the package source appropriate for the workstation CUDA driver; this repository does not hard-code a CUDA wheel URL. `requirements.txt` remains untouched, and `requirements_legacy.txt` records the original environment.
+
+PyTorchVideo is not required. Video-file input continues to use `decord.VideoReader`, so `decord` remains in the modern environment.
 
 ## Commands
 
@@ -72,6 +74,16 @@ python run_uvg_hnerv_suite.py \
   --smoke
 ```
 
+Run a one-epoch benchmark for one configuration:
+
+```bash
+python run_uvg_hnerv_suite.py \
+  --data-root /datasets/UVG \
+  --output-root /runs/uvg7_benchmark \
+  --sequences HoneyBee --sizes 0.35 --families rgb444 \
+  --epochs 1
+```
+
 Run the full sequential suite on GPU 0:
 
 ```bash
@@ -79,10 +91,13 @@ python run_uvg_hnerv_suite.py \
   --data-root /datasets/UVG \
   --output-root /runs/uvg7_hnerv_150e \
   --backup-root /persistent-backup/uvg7 \
+  --strict-backup \
   --gpu 0
 ```
 
-Completed jobs are skipped. A directory containing `model_latest.pth` without a complete `completion.json` resumes automatically with the same command. Destructive reruns require both `--force --yes`.
+`--backup-root` enables automatic restoration before each run is classified. A restored complete run is skipped, a restored incomplete run containing `model_latest.pth` resumes, and a run with no usable local or backup checkpoint starts new. Checkpoints and JSON metadata are validated, and a newer corrupt backup does not replace a valid local copy. `--strict-backup` turns backup-copy warnings into trainer failures; without it, backup errors are logged and training continues.
+
+After a DeepFreeze restart, clone or restore this repository and launch the same command with the same persistent `--backup-root`. The launcher reconstructs wiped local run directories before deciding whether to skip or resume. Keep the backup root on genuinely persistent storage, not another DeepFreeze-controlled directory on `C:`. Completed jobs are skipped, and destructive reruns require both `--force --yes`.
 
 Run one sequence, size, or family:
 

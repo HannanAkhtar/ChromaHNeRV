@@ -32,7 +32,9 @@ from hnerv_utils import *
 from model_all import HNeRV, HNeRVDecoder, TransformInput, VideoDataSet, decoder_channel_schedule
 from model_chroma_hnerv import ChromaHNeRV420, RGBSplitHNeRV
 from uvg_utils import (
-    apply_dataset_preset, atomic_torch_save, split_resolution_metadata,
+    apply_dataset_preset, atomic_torch_save, backup_artifact_names,
+    checkpoint_best_rgb_psnr, split_resolution_metadata,
+    update_best_rgb_psnr,
 )
 
 
@@ -361,25 +363,26 @@ def write_run_metadata(args):
             file.write(environment)
 
 
+def backup_artifact_sources(args, final=False):
+    csv_files = sorted(
+        [name for name in os.listdir(args.outf) if name.endswith(".csv")],
+        key=lambda name: os.path.getmtime(os.path.join(args.outf, name)))
+    names = backup_artifact_names(
+        args.epochs, final, launcher_log=args.launcher_log_path,
+        latest_csv=csv_files[-1] if csv_files else "")
+    return [
+        name if os.path.isabs(name) else os.path.join(args.outf, name)
+        for name in dict.fromkeys(names)
+    ]
+
+
 def backup_run_artifacts(args, final=False):
     if not args.backup_root:
         return
     destination = os.path.join(args.backup_root, args.run_relative_path)
-    names = ["model_latest.pth", "rank0.txt", "config.json", "command.txt"]
-    if args.launcher_log_path:
-        names.append(args.launcher_log_path)
-    csv_files = sorted(
-        [name for name in os.listdir(args.outf) if name.endswith(".csv")],
-        key=lambda name: os.path.getmtime(os.path.join(args.outf, name)))
-    if csv_files:
-        names.append(csv_files[-1])
-    if final:
-        names.extend(["model_best.pth", f"epoch{args.epochs}.pth",
-                      f"epoch{args.epochs}.csv", "completion.json"])
     try:
         os.makedirs(destination, exist_ok=True)
-        for name in dict.fromkeys(names):
-            source = name if os.path.isabs(name) else os.path.join(args.outf, name)
+        for source in backup_artifact_sources(args, final):
             if os.path.isfile(source):
                 shutil.copy2(source, os.path.join(destination, os.path.basename(source)))
     except Exception as exc:
@@ -771,6 +774,17 @@ def train(local_rank, args):
     if args.start_epoch < 0:
         args.start_epoch = checkpoint["epoch"] if checkpoint is not None else 0
         args.start_epoch = max(args.start_epoch, 0)
+    best_rgb_psnr = checkpoint_best_rgb_psnr(checkpoint)
+    if checkpoint is not None:
+        if "best_rgb_psnr" in checkpoint:
+            print(
+                f"=> restored historical best_rgb_psnr={best_rgb_psnr:.6f}",
+                flush=True)
+        else:
+            print(
+                "=> checkpoint has no best_rgb_psnr; historical best is "
+                "unavailable and defaults to -inf",
+                flush=True)
 
     if args.eval_only:
         metrics_by_variant, hw = evaluate(
@@ -784,7 +798,6 @@ def train(local_rank, args):
         return
 
     start = datetime.now()
-    best_rgb_psnr = -float("inf")
     last_metrics = None
     for epoch in range(args.start_epoch, args.epochs):
         evaluated_this_epoch = False
@@ -850,8 +863,8 @@ def train(local_rank, args):
             evaluated_this_epoch = True
             if local_rank in [0, None]:
                 cur_psnr = last_metrics["orig"].get("rgb_psnr", float("nan"))
-                is_best_epoch = cur_psnr >= best_rgb_psnr
-                best_rgb_psnr = max(best_rgb_psnr, cur_psnr)
+                is_best_epoch, best_rgb_psnr = update_best_rgb_psnr(
+                    cur_psnr, best_rgb_psnr)
                 writer.add_scalar(f"Val/rgb_psnr_{hw}", cur_psnr, epoch + 1)
                 print_str = f"Eval at epoch {epoch + 1} for {hw}: rgb_psnr: {cur_psnr:.2f} best_rgb_psnr: {best_rgb_psnr:.2f}"
                 print(print_str, flush=True)
@@ -860,6 +873,7 @@ def train(local_rank, args):
 
         save_checkpoint = {
             "epoch": epoch + 1,
+            "best_rgb_psnr": float(best_rgb_psnr),
             "state_dict": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "architecture_config": {
@@ -904,7 +918,16 @@ def train(local_rank, args):
                 dump_csv(args, last_metrics, f"epoch{epoch + 1}.csv")
                 append_consolidated_csv(args, last_metrics)
                 atomic_torch_save(save_checkpoint, f"{args.outf}/epoch{epoch + 1}.pth")
+                model_best_fallback = False
                 if not os.path.isfile(f"{args.outf}/model_best.pth"):
+                    model_best_fallback = True
+                    warning = (
+                        "WARNING: historical model_best.pth is unavailable and "
+                        "no resumed evaluation reached best_rgb_psnr; using the "
+                        "final checkpoint as a fallback.")
+                    print(warning, flush=True)
+                    with open(f"{args.outf}/rank0.txt", "a") as file:
+                        file.write(warning + "\n")
                     atomic_torch_save(save_checkpoint, f"{args.outf}/model_best.pth")
                 completion = {
                     "status": "complete",
@@ -913,6 +936,9 @@ def train(local_rank, args):
                     "timestamp": datetime.now().astimezone().isoformat(),
                     "final_evaluation_mode": args.final_eval_mode,
                     "quantization": f"M{args.quant_model_bit}/E{args.quant_embed_bit}",
+                    "best_rgb_psnr": float(best_rgb_psnr),
+                    "model_best_fallback": model_best_fallback,
+                    "restored_from_backup": False,
                 }
                 atomic_json_dump(completion, os.path.join(args.outf, "completion.json"))
                 write_run_metadata(args)

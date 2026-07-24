@@ -25,7 +25,10 @@ def write_run(root, name, row):
     run = root / name
     run.mkdir()
     pd.DataFrame([row]).to_csv(run / "epoch150.csv", index=False)
-    (run / "completion.json").write_text(json.dumps({"status": "complete"}))
+    (run / "epoch150.pth").write_bytes(b"final")
+    (run / "model_best.pth").write_bytes(b"best")
+    (run / "completion.json").write_text(
+        json.dumps({"status": "complete", "epoch": 150}))
 
 
 def test_merger_reports_duplicates_missing_and_invalid_quantization(tmp_path):
