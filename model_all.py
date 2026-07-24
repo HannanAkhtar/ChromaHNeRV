@@ -18,6 +18,7 @@ from torch.nn.functional import interpolate
 import decord
 decord.bridge.set_bridge('torch')
 import glob
+from uvg_utils import discover_image_files
 
 # Video dataset
 class VideoDataSet(Dataset):
@@ -25,13 +26,52 @@ class VideoDataSet(Dataset):
         if os.path.isfile(args.data_path):
             self.video = decord.VideoReader(args.data_path)
         else:
-            self.video = [os.path.join(args.data_path, x) for x in sorted(os.listdir(args.data_path))]
+            self.video = discover_image_files(args.data_path)
 
         # Resize the input video and center crop
         self.crop_list, self.resize_list = args.crop_list, args.resize_list
-        # import pdb; pdb.set_trace; from IPython import embed; embed()     
+        frame_count = len(self.video)
+        expected_frames = getattr(args, "expected_frames", -1)
+        if expected_frames not in (-1, None) and frame_count != expected_frames:
+            raise ValueError(
+                f"Sequence {args.data_path} contains {frame_count} images, "
+                f"but {expected_frames} were expected.")
+
+        validation_indices = sorted({0, frame_count // 2, frame_count - 1})
+        source_shapes = {}
+        for index in validation_indices:
+            frame = self.img_load(index)
+            source_shapes[index] = tuple(frame.shape[-2:])
+        unique_shapes = set(source_shapes.values())
+        if len(unique_shapes) != 1:
+            raise ValueError(
+                f"Inconsistent source frame dimensions in {args.data_path}: {source_shapes}")
+
+        source_height, source_width = source_shapes[0]
+        expected_height = getattr(args, "expected_source_height", -1)
+        expected_width = getattr(args, "expected_source_width", -1)
+        if expected_height not in (-1, None) and source_height != expected_height:
+            raise ValueError(
+                f"Sequence source height is {source_height}, expected {expected_height}.")
+        if expected_width not in (-1, None) and source_width != expected_width:
+            raise ValueError(
+                f"Sequence source width is {source_width}, expected {expected_width}.")
+
         first_frame = self.img_transform(self.img_load(0))
         self.final_size = first_frame.size(-2) * first_frame.size(-1)
+        self.source_height, self.source_width = source_height, source_width
+        self.final_height, self.final_width = first_frame.shape[-2:]
+        args.detected_frames = frame_count
+        args.detected_source_height = source_height
+        args.detected_source_width = source_width
+        args.detected_final_height = self.final_height
+        args.detected_final_width = self.final_width
+        print(
+            f"Detected sequence: {args.data_path}\n"
+            f"  frames: {frame_count}\n"
+            f"  source resolution: {source_height}x{source_width}\n"
+            f"  transformed resolution: {self.final_height}x{self.final_width}",
+            flush=True)
 
     def img_load(self, idx):
         if isinstance(self.video, list):
@@ -158,6 +198,7 @@ class HNeRV(nn.Module):
         self.decoder = nn.ModuleList(decoder_layers)
         self.head_layer = nn.Conv2d(ngf, 3, 3, 1, 1) 
         self.out_bias = args.out_bias
+        self.measure_latency = getattr(args, "measure_latency", False) or getattr(args, "eval_fps", False)
 
     def forward(self, input, input_embed=None, encode_only=False):
         if input_embed != None:
@@ -179,7 +220,7 @@ class HNeRV(nn.Module):
             embed_list.append(output)
 
         img_out = OutImg(self.head_layer(output), self.out_bias)
-        if torch.cuda.is_available():
+        if self.measure_latency and torch.cuda.is_available():
             torch.cuda.synchronize()
         dec_time = time.time() - dec_start
 

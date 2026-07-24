@@ -1,0 +1,58 @@
+{
+  "Beauty": {
+    "frames": 600,
+    "source_height": 1080,
+    "source_width": 1920,
+    "crop_height": 960,
+    "crop_width": 1920,
+    "fps": 120
+  },
+  "Bosphorus": {
+    "frames": 600,
+    "source_height": 1080,
+    "source_width": 1920,
+    "crop_height": 960,
+    "crop_width": 1920,
+    "fps": 120
+  },
+  "HoneyBee": {
+    "frames": 600,
+    "source_height": 1080,
+    "source_width": 1920,
+    "crop_height": 960,
+    "crop_width": 1920,
+    "fps": 120
+  },
+  "Jockey": {
+    "frames": 600,
+    "source_height": 1080,
+    "source_width": 1920,
+    "crop_height": 960,
+    "crop_width": 1920,
+    "fps": 120
+  },
+  "ReadySetGo": {
+    "frames": 600,
+    "source_height": 1080,
+    "source_width": 1920,
+    "crop_height": 960,
+    "crop_width": 1920,
+    "fps": 120
+  },
+  "ShakeNDry": {
+    "frames": 300,
+    "source_height": 1080,
+    "source_width": 1920,
+    "crop_height": 960,
+    "crop_width": 1920,
+    "fps": 120
+  },
+  "YachtRide": {
+    "frames": 600,
+    "source_height": 1080,
+    "source_width": 1920,
+    "crop_height": 960,
+    "crop_width": 1920,
+    "fps": 120
+  }
+}
