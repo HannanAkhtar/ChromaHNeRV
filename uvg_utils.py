@@ -2,6 +2,7 @@ import json
 import math
 import os
 import re
+import shutil
 from pathlib import Path
 
 
@@ -225,3 +226,92 @@ def completion_status(run_dir, epochs):
     if (run_dir / "model_latest.pth").is_file():
         return "resume"
     return "new"
+
+
+def checkpoint_best_rgb_psnr(checkpoint):
+    if checkpoint is None or "best_rgb_psnr" not in checkpoint:
+        return -float("inf")
+    return float(checkpoint["best_rgb_psnr"])
+
+
+def update_best_rgb_psnr(current_rgb_psnr, historical_best):
+    is_best = current_rgb_psnr >= historical_best
+    return is_best, max(historical_best, current_rgb_psnr)
+
+
+def backup_artifact_names(
+        epochs, final=False, launcher_log="", latest_csv=""):
+    names = [
+        "model_latest.pth", "model_best.pth", "rank0.txt", "config.json",
+        "command.txt", "environment.txt", "git_commit.txt",
+    ]
+    if latest_csv:
+        names.append(latest_csv)
+    if launcher_log:
+        names.append(launcher_log)
+    if final:
+        names.extend([
+            f"epoch{epochs}.pth", f"epoch{epochs}.csv", "completion.json",
+            "quant_vid.pth", "img_decoder.pth",
+        ])
+    return names
+
+
+def artifact_is_valid(path):
+    path = Path(path)
+    if not path.is_file():
+        return False
+    if path.suffix == ".pth":
+        try:
+            import torch
+            torch.load(path, map_location="cpu")
+        except Exception:
+            return False
+    elif path.name in {"completion.json", "config.json", "failure.json"}:
+        try:
+            with path.open(encoding="utf-8") as file:
+                json.load(file)
+        except (OSError, json.JSONDecodeError):
+            return False
+    return True
+
+
+def restore_run_from_backup(local_run_dir, backup_run_dir, epochs):
+    local_run_dir = Path(local_run_dir)
+    backup_run_dir = Path(backup_run_dir)
+    summary = {
+        "restored": [],
+        "kept_local": [],
+        "invalid_local": [],
+        "invalid_backup": [],
+    }
+    if not backup_run_dir.is_dir():
+        return summary
+
+    for backup_path in backup_run_dir.rglob("*"):
+        if not backup_path.is_file() or backup_path.suffix.lower() in IMAGE_EXTENSIONS:
+            continue
+        relative_path = backup_path.relative_to(backup_run_dir)
+        local_path = local_run_dir / relative_path
+        backup_valid = artifact_is_valid(backup_path)
+        local_valid = artifact_is_valid(local_path) if local_path.exists() else False
+
+        if local_path.exists() and not local_valid:
+            summary["invalid_local"].append(str(relative_path))
+        if not backup_valid:
+            summary["invalid_backup"].append(str(relative_path))
+            if local_path.exists():
+                summary["kept_local"].append(str(relative_path))
+            continue
+
+        should_restore = not local_path.exists() or not local_valid
+        if local_path.exists() and local_valid:
+            should_restore = (
+                backup_path.stat().st_mtime > local_path.stat().st_mtime)
+        if should_restore:
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup_path, local_path)
+            summary["restored"].append(str(relative_path))
+        else:
+            summary["kept_local"].append(str(relative_path))
+    return summary

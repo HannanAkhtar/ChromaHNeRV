@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import trunc_normal_, DropPath
-from pytorchvideo.data.encoded_video import EncodedVideo
 from torchvision.transforms.functional import center_crop, resize
 from torchvision.io import read_image
 from torch.nn.functional import interpolate

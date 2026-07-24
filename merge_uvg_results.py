@@ -43,12 +43,31 @@ def expected_key(job):
     )
 
 
+def completed_run_artifacts(run_dir):
+    run_dir = Path(run_dir)
+    try:
+        completion = json.loads(
+            (run_dir / "completion.json").read_text(encoding="utf-8"))
+        epoch = int(completion["epoch"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return False
+    required = [
+        run_dir / f"epoch{epoch}.pth",
+        run_dir / f"epoch{epoch}.csv",
+        run_dir / "model_best.pth",
+    ]
+    return completion.get("status") == "complete" and all(
+        path.is_file() for path in required)
+
+
 def merge_results(output_root, destination, seed=1):
     output_root, destination = Path(output_root), Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     records, failures = [], []
     recorded_failure_dirs = set()
     for failure_path in output_root.rglob("failure.json"):
+        if completed_run_artifacts(failure_path.parent):
+            continue
         try:
             details = json.loads(failure_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -61,21 +80,18 @@ def merge_results(output_root, destination, seed=1):
         recorded_failure_dirs.add(failure_path.parent)
     for csv_path in output_root.rglob("epoch*.csv"):
         run_dir = csv_path.parent
-        completion = run_dir / "completion.json"
-        try:
-            status = json.loads(completion.read_text(encoding="utf-8")).get("status")
-        except (OSError, json.JSONDecodeError):
-            status = None
+        is_complete = completed_run_artifacts(run_dir)
         try:
             frame = pd.read_csv(csv_path)
         except Exception as exc:
             failures.append({"run_dir": str(run_dir), "csv_path": str(csv_path), "reason": str(exc)})
             continue
-        if status != "complete" and run_dir not in recorded_failure_dirs:
-            failures.append({
-                "run_dir": str(run_dir), "csv_path": str(csv_path),
-                "reason": "completion.json is absent or not complete",
-            })
+        if not is_complete:
+            if run_dir not in recorded_failure_dirs:
+                failures.append({
+                    "run_dir": str(run_dir), "csv_path": str(csv_path),
+                    "reason": "completion marker or required final artifacts are incomplete",
+                })
             continue
         for _, row in frame.iterrows():
             record = row.to_dict()

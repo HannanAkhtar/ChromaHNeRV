@@ -9,7 +9,6 @@ tqdm>=4.66
 dahuffman>=0.4.2
 decord>=0.6
 pytorch-msssim>=1.0
-pytorchvideo>=0.1.5
 imageio>=2.34
 imageio-ffmpeg>=0.5
 lpips>=0.1.4
