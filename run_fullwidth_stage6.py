@@ -61,31 +61,108 @@ def validate_signature(path, family):
 
 
 def locate_full_checkpoint(drive_root, family, size):
-    family_tokens = ("ycbcr",) if family == "full_ycbcr" else ("rgb444", "rgb_hnerv")
-    size_tokens = {f"{size_tag(size)}m", f"{str(size)}m", f"size{size}"}
+    """Locate an existing Stage 1-4 full HNeRV checkpoint robustly.
+
+    Prefer the exact known run-folder naming used by the earlier stages, then
+    fall back to a broader recursive search. Rejected candidates are reported
+    instead of being silently discarded.
+    """
+    output_root = drive_root / "output"
+    if not output_root.is_dir():
+        raise FileNotFoundError(f"Drive output root does not exist: {output_root}")
+
+    tag = size_tag(size)
+    if family == "full_rgb":
+        exact_run_tokens = [
+            f"rgb444_hnerv_rgb_hnerv_{tag}m_bunny",
+            f"rgb444_hnerv_rgb444_hnerv_{tag}m_bunny",
+        ]
+        family_tokens = ("rgb444_hnerv", "rgb_hnerv")
+        forbidden_path_tokens = ("ycbcr",)
+    elif family == "full_ycbcr":
+        exact_run_tokens = [
+            f"ycbcr444_hnerv_ycbcr_hnerv_{tag}m_bunny",
+            f"ycbcr444_hnerv_ycbcr444_hnerv_{tag}m_bunny",
+        ]
+        family_tokens = ("ycbcr444_hnerv", "ycbcr_hnerv")
+        forbidden_path_tokens = ()
+    else:
+        raise ValueError(f"Unsupported full-model family: {family}")
+
+    all_epoch150 = sorted(output_root.rglob("epoch150.pth"))
+    preferred = [
+        path for path in all_epoch150
+        if any(token in str(path).lower() for token in exact_run_tokens)
+        and "stage6_" not in str(path).lower()
+    ]
+
+    # Broader fallback for slightly different historical folder names.
+    size_tokens = (
+        f"{tag}m",
+        f"size{size}",
+        f"size{float(size)}",
+    )
+    fallback = [
+        path for path in all_epoch150
+        if "stage6_" not in str(path).lower()
+        and any(token in str(path).lower() for token in family_tokens)
+        and any(token in str(path).lower() for token in size_tokens)
+        and not any(token in str(path).lower() for token in forbidden_path_tokens)
+    ]
+
     candidates = []
-    for path in (drive_root / "output").rglob("epoch150.pth"):
-        lowered = str(path).lower()
-        if "stage6_" in lowered or not any(token in lowered for token in family_tokens):
-            continue
-        if family == "full_rgb" and "ycbcr" in lowered:
-            continue
-        if not any(token in lowered for token in size_tokens):
-            continue
+    for path in preferred + fallback:
+        if path not in candidates:
+            candidates.append(path)
+
+    accepted = []
+    rejected = []
+    for path in candidates:
         try:
-            validate_signature(path, family)
+            info = validate_signature(path, family)
             checkpoint = torch.load(path, map_location="cpu")
             recorded_size = checkpoint.get("architecture_config", {}).get("modelsize")
-            if recorded_size is not None and abs(float(recorded_size) - size) > 1e-9:
+            if recorded_size is not None and abs(float(recorded_size) - float(size)) > 1e-9:
+                rejected.append((path, f"recorded modelsize={recorded_size}"))
                 continue
-            candidates.append(path)
-        except ValueError:
-            pass
-    if not candidates:
-        raise FileNotFoundError(f"No Stage 1-4 {family} epoch150 checkpoint found for {size}M.")
-    candidates.sort(key=lambda path: ("stage1" not in str(path).lower(), "stage4" not in str(path).lower(), len(str(path))))
-    selected = candidates[0]
+            accepted.append((path, info))
+        except Exception as error:
+            rejected.append((path, f"{type(error).__name__}: {error}"))
+
+    if not accepted:
+        diagnostic = [
+            f"No Stage 1-4 {family} epoch150 checkpoint found for {size}M.",
+            f"Scanned output root: {output_root}",
+            f"Total epoch150 checkpoints seen: {len(all_epoch150)}",
+            f"Path candidates after name filtering: {len(candidates)}",
+        ]
+        if rejected:
+            diagnostic.append("Rejected candidates:")
+            diagnostic.extend(f"  - {path}: {reason}" for path, reason in rejected)
+        else:
+            diagnostic.append("No path matched the expected family/size tokens.")
+            diagnostic.append(f"Expected run-folder tokens: {exact_run_tokens}")
+        raise FileNotFoundError("\n".join(diagnostic))
+
+    # Prefer Stage 1 for 0.35/0.75/1.5 and Stage 4 for 3.0, then shortest path.
+    def preference(item):
+        path = item[0]
+        lowered = str(path).lower()
+        preferred_stage_penalty = (
+            0 if ((size < 3.0 and "stage1_" in lowered) or
+                  (size >= 3.0 and "stage4_" in lowered))
+            else 1
+        )
+        return (preferred_stage_penalty, len(str(path)), str(path))
+
+    accepted.sort(key=preference)
+    selected, info = accepted[0]
     print(f"Selected {family} {size}M: {selected}")
+    print(f"  epoch={info.get('epoch')} tensors={info.get('tensor_count')}")
+    if len(accepted) > 1:
+        print("  Other valid candidates:")
+        for path, _ in accepted[1:]:
+            print(f"    - {path}")
     return selected
 
 
