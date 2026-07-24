@@ -713,7 +713,8 @@ def train(local_rank, args):
     full_dataloader = torch.utils.data.DataLoader(
         full_dataset, batch_size=args.batchSize, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=sampler, drop_last=False,
-        worker_init_fn=worker_init_fn)
+        worker_init_fn=worker_init_fn,
+        persistent_workers=args.workers > 0)
     args.final_size = full_dataset.final_size
     args.full_data_length = len(full_dataset)
     split_num_list = [int(x) for x in args.data_split.split("_")]
@@ -725,7 +726,8 @@ def train(local_rank, args):
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batchSize, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True,
-        worker_init_fn=worker_init_fn)
+        worker_init_fn=worker_init_fn,
+        persistent_workers=args.workers > 0)
 
     configure_model_size_args(args)
     model = build_model(args)
