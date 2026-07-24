@@ -2,10 +2,14 @@ import argparse
 import csv
 import io
 import imageio
+import json
 import math
 import os
+import platform
 import random
+import shlex
 import shutil
+import subprocess
 import sys
 import time
 from copy import deepcopy
@@ -27,6 +31,9 @@ from torchvision.utils import save_image
 from hnerv_utils import *
 from model_all import HNeRV, HNeRVDecoder, TransformInput, VideoDataSet, decoder_channel_schedule
 from model_chroma_hnerv import ChromaHNeRV420, RGBSplitHNeRV
+from uvg_utils import (
+    apply_dataset_preset, atomic_torch_save, split_resolution_metadata,
+)
 
 
 RGB_STYLE_EXPERIMENTS = ("rgb444_hnerv", "rgbsplit_a320", "rgbsplit_a160")
@@ -81,6 +88,10 @@ Sanity-check examples (small/debug only, not full experiments):
         help="Valid_train/total_train/all data split")
     parser.add_argument("--crop_list", type=str, default="640_1280", help="video crop size")
     parser.add_argument("--resize_list", type=str, default="-1", help="video resize size")
+    parser.add_argument("--dataset_preset", choices=["none", "uvg_hnerv"], default="none")
+    parser.add_argument("--expected_frames", type=int, default=-1)
+    parser.add_argument("--expected_source_height", type=int, default=-1)
+    parser.add_argument("--expected_source_width", type=int, default=-1)
 
     parser.add_argument("--embed", type=str, default="", help="empty for HNeRV; pe/le string for NeRV")
     parser.add_argument("--ks", type=str, default="0_3_3", help="kernel size for encoder and decoder")
@@ -128,6 +139,9 @@ Sanity-check examples (small/debug only, not full experiments):
     parser.add_argument("--dump_images", action="store_true", default=False, help="dump prediction images")
     parser.add_argument("--dump_videos", action="store_true", default=False, help="concat predictions into video")
     parser.add_argument("--eval_fps", action="store_true", default=False, help="forward multiple times for fps")
+    parser.add_argument("--measure_latency", action="store_true", default=False)
+    parser.add_argument("--intermediate_eval_mode", choices=["quick", "full"], default="quick")
+    parser.add_argument("--final_eval_mode", choices=["quick", "full"], default="full")
     parser.add_argument("--encoder_file", default="", type=str, help="specify the embedding file")
 
     parser.add_argument("--manualSeed", type=int, default=1, help="manual seed")
@@ -137,7 +151,12 @@ Sanity-check examples (small/debug only, not full experiments):
     parser.add_argument("--weight", default="None", type=str, help="pretrained weights")
     parser.add_argument("--overwrite", action="store_true", help="overwrite the output dir")
     parser.add_argument("--outf", default="unify", help="folder to output images and model checkpoints")
+    parser.add_argument("--run_dir", default="", help="exact run directory; primarily for suite launchers")
     parser.add_argument("--suffix", default="", help="suffix str for outf")
+    parser.add_argument("--backup_root", default="")
+    parser.add_argument("--backup_at_eval", action="store_true")
+    parser.add_argument("--strict_backup", action="store_true")
+    parser.add_argument("--launcher_log_path", default="")
 
     parser.add_argument("--experiment", default="rgb444_hnerv", choices=CHROMA_EXPERIMENTS)
     parser.add_argument("--run_name", default="", type=str)
@@ -157,7 +176,9 @@ Sanity-check examples (small/debug only, not full experiments):
 
 def main():
     parser = build_parser()
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    args = parser.parse_args(argv)
+    apply_dataset_preset(args, parser, argv)
     normalize_experiment_args(args)
     torch.set_printoptions(precision=4)
     setup_output_dir(args)
@@ -225,8 +246,9 @@ def validate_quant_args(args):
 def setup_output_dir(args):
     if args.debug:
         args.eval_freq = 1
+    if not args.run_dir and args.debug:
         args.outf = "output/debug"
-    else:
+    elif not args.run_dir:
         args.outf = os.path.join("output", args.outf)
     args.enc_strd_str = ",".join([str(x) for x in args.enc_strds])
     args.dec_strd_str = ",".join([str(x) for x in args.dec_strds])
@@ -256,11 +278,115 @@ def setup_output_dir(args):
         f"_low{args.lower_width}_blk{args.num_blks}_e{args.epochs}_b{args.batchSize}_{args.quant_str}"
         f"_lr{args.lr}_{args.lr_type}_{args.loss}_{extra_str}{args.act}{args.block_params}{split_str}{args.suffix}"
     )
-    args.outf = os.path.join(args.outf, args.exp_id)
+    args.run_relative_path = os.path.basename(os.path.normpath(args.run_dir)) if args.run_dir else args.exp_id
+    args.outf = args.run_dir if args.run_dir else os.path.join(args.outf, args.exp_id)
     if args.overwrite and os.path.isdir(args.outf):
         print("Will overwrite the existing output dir!")
         shutil.rmtree(args.outf)
     os.makedirs(args.outf, exist_ok=True)
+    with open(os.path.join(args.outf, "command.txt"), "w", encoding="utf-8") as file:
+        file.write(shlex.join([sys.executable, *sys.argv]) + "\n")
+    split_alias = args.split_stage if args.experiment in SPLIT_EXPERIMENTS else None
+    for key, value in split_resolution_metadata(args.crop_list, args.dec_strds, split_alias).items():
+        setattr(args, key, value)
+
+
+def _json_safe(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def git_state():
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        dirty = bool(subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip())
+        return commit, dirty
+    except Exception:
+        return "unavailable", False
+
+
+def atomic_json_dump(payload, destination):
+    temporary = destination + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2, sort_keys=True)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def write_run_metadata(args):
+    import torchvision
+
+    commit, dirty = git_state()
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    metadata = {key: _json_safe(value) for key, value in vars(args).items()
+                if key not in {"transform_func"}}
+    metadata.update({
+        "sequence_name": args.vid,
+        "dataset_path": args.data_path,
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "gpu_name": gpu_name,
+        "cuda_version": torch.version.cuda,
+        "pytorch_version": torch.__version__,
+        "torchvision_version": torchvision.__version__,
+        "python_version": platform.python_version(),
+        "git_commit": commit,
+        "git_dirty": dirty,
+    })
+    atomic_json_dump(metadata, os.path.join(args.outf, "config.json"))
+    with open(os.path.join(args.outf, "git_commit.txt"), "w", encoding="utf-8") as file:
+        file.write(f"commit={commit}\ndirty={str(dirty).lower()}\n")
+
+    environment_path = os.path.join(args.outf, "environment.txt")
+    if not os.path.exists(environment_path):
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "freeze"],
+                capture_output=True, text=True, check=True)
+            environment = result.stdout
+        except Exception as exc:
+            environment = f"pip freeze unavailable: {exc}\n"
+        with open(environment_path, "w", encoding="utf-8") as file:
+            file.write(environment)
+
+
+def backup_run_artifacts(args, final=False):
+    if not args.backup_root:
+        return
+    destination = os.path.join(args.backup_root, args.run_relative_path)
+    names = ["model_latest.pth", "rank0.txt", "config.json", "command.txt"]
+    if args.launcher_log_path:
+        names.append(args.launcher_log_path)
+    csv_files = sorted(
+        [name for name in os.listdir(args.outf) if name.endswith(".csv")],
+        key=lambda name: os.path.getmtime(os.path.join(args.outf, name)))
+    if csv_files:
+        names.append(csv_files[-1])
+    if final:
+        names.extend(["model_best.pth", f"epoch{args.epochs}.pth",
+                      f"epoch{args.epochs}.csv", "completion.json"])
+    try:
+        os.makedirs(destination, exist_ok=True)
+        for name in dict.fromkeys(names):
+            source = name if os.path.isabs(name) else os.path.join(args.outf, name)
+            if os.path.isfile(source):
+                shutil.copy2(source, os.path.join(destination, os.path.basename(source)))
+    except Exception as exc:
+        message = f"Backup failed for {args.outf}: {exc}"
+        print(message, flush=True)
+        if args.strict_backup:
+            raise RuntimeError(message) from exc
 
 
 def data_to_gpu(x, device):
@@ -628,6 +754,7 @@ def train(local_rank, args):
     device = next(model.parameters()).device
     if local_rank in [0, None]:
         args.estimated_gflops = estimate_gflops(model, full_dataloader, args, device)
+        write_run_metadata(args)
     else:
         args.estimated_gflops = float("nan")
 
@@ -646,7 +773,9 @@ def train(local_rank, args):
         args.start_epoch = max(args.start_epoch, 0)
 
     if args.eval_only:
-        metrics_by_variant, hw = evaluate(model, full_dataloader, local_rank, args, args.dump_vis, huffman_coding=True)
+        metrics_by_variant, hw = evaluate(
+            model, full_dataloader, local_rank, args, args.dump_vis,
+            huffman_coding=True, evaluation_mode=args.final_eval_mode)
         if local_rank in [0, None]:
             args.train_time, args.cur_epoch = 0, args.epochs
             dump_csv(args, metrics_by_variant, "eval.csv")
@@ -658,6 +787,8 @@ def train(local_rank, args):
     best_rgb_psnr = -float("inf")
     last_metrics = None
     for epoch in range(args.start_epoch, args.epochs):
+        evaluated_this_epoch = False
+        is_best_epoch = False
         model.train()
         epoch_start_time = datetime.now()
         pred_psnr_list = []
@@ -709,12 +840,17 @@ def train(local_rank, args):
                 (epoch_end_time - start).total_seconds() / (epoch + 1 - args.start_epoch)))
 
         if (epoch + 1) % args.eval_freq == 0 or (args.epochs - epoch) in [1, 3, 5]:
+            is_final_epoch = epoch + 1 == args.epochs
+            evaluation_mode = args.final_eval_mode if is_final_epoch else args.intermediate_eval_mode
             last_metrics, hw = evaluate(
                 model, full_dataloader, local_rank, args,
-                args.dump_vis if epoch == args.epochs - 1 else False,
-                huffman_coding=(epoch == args.epochs - 1))
+                args.dump_vis if is_final_epoch and evaluation_mode == "full" else False,
+                huffman_coding=(is_final_epoch and evaluation_mode == "full"),
+                evaluation_mode=evaluation_mode)
+            evaluated_this_epoch = True
             if local_rank in [0, None]:
                 cur_psnr = last_metrics["orig"].get("rgb_psnr", float("nan"))
+                is_best_epoch = cur_psnr >= best_rgb_psnr
                 best_rgb_psnr = max(best_rgb_psnr, cur_psnr)
                 writer.add_scalar(f"Val/rgb_psnr_{hw}", cur_psnr, epoch + 1)
                 print_str = f"Eval at epoch {epoch + 1} for {hw}: rgb_psnr: {cur_psnr:.2f} best_rgb_psnr: {best_rgb_psnr:.2f}"
@@ -740,20 +876,47 @@ def train(local_rank, args):
                 "rgb_branch_channels": getattr(args, "rgb_branch_channels", ""),
                 "y_branch_channels": getattr(args, "y_branch_channels", ""),
                 "chroma_branch_channels": getattr(args, "chroma_branch_channels", ""),
+                "decoder_stage_resolutions": args.decoder_stage_resolutions,
+                "split_alias": args.split_alias,
+                "split_stage_index": args.split_stage_index,
+                "shared_output_height": args.shared_output_height,
+                "shared_output_width": args.shared_output_width,
+                "chroma_output_height": args.chroma_output_height,
+                "chroma_output_width": args.chroma_output_width,
+                "final_output_height": args.final_output_height,
+                "final_output_width": args.final_output_width,
             },
         }
         if local_rank in [0, None]:
-            torch.save(save_checkpoint, f"{args.outf}/model_latest.pth")
+            atomic_torch_save(save_checkpoint, f"{args.outf}/model_latest.pth")
+            if evaluated_this_epoch and is_best_epoch:
+                atomic_torch_save(save_checkpoint, f"{args.outf}/model_best.pth")
+            if evaluated_this_epoch and args.backup_at_eval:
+                backup_run_artifacts(args)
             if epoch + 1 == args.epochs:
                 args.cur_epoch = epoch + 1
                 args.train_time = str(datetime.now() - start)
                 if last_metrics is None:
-                    last_metrics, _ = evaluate(model, full_dataloader, local_rank, args, args.dump_vis, huffman_coding=True)
+                    last_metrics, _ = evaluate(
+                        model, full_dataloader, local_rank, args, args.dump_vis,
+                        huffman_coding=(args.final_eval_mode == "full"),
+                        evaluation_mode=args.final_eval_mode)
                 dump_csv(args, last_metrics, f"epoch{epoch + 1}.csv")
                 append_consolidated_csv(args, last_metrics)
-                torch.save(save_checkpoint, f"{args.outf}/epoch{epoch + 1}.pth")
-                if last_metrics["orig"].get("rgb_psnr", -float("inf")) >= best_rgb_psnr:
-                    torch.save(save_checkpoint, f"{args.outf}/model_best.pth")
+                atomic_torch_save(save_checkpoint, f"{args.outf}/epoch{epoch + 1}.pth")
+                if not os.path.isfile(f"{args.outf}/model_best.pth"):
+                    atomic_torch_save(save_checkpoint, f"{args.outf}/model_best.pth")
+                completion = {
+                    "status": "complete",
+                    "epoch": epoch + 1,
+                    "run_name": args.run_name,
+                    "timestamp": datetime.now().astimezone().isoformat(),
+                    "final_evaluation_mode": args.final_eval_mode,
+                    "quantization": f"M{args.quant_model_bit}/E{args.quant_embed_bit}",
+                }
+                atomic_json_dump(completion, os.path.join(args.outf, "completion.json"))
+                write_run_metadata(args)
+                backup_run_artifacts(args, final=True)
 
     if local_rank in [0, None]:
         print(f"Training complete in: {str(datetime.now() - start)}")
@@ -788,13 +951,21 @@ def load_checkpoint_if_needed(model, optimizer, args, local_rank):
 
 
 @torch.no_grad()
-def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_coding=False):
+def evaluate(
+        model, full_dataloader, local_rank, args, dump_vis=False,
+        huffman_coding=False, evaluation_mode="full"):
+    full_evaluation = evaluation_mode == "full"
     img_embed_list = []
-    model_list, quant_ckt, quant_report = quant_model(model, args)
+    if full_evaluation:
+        model_list, quant_ckt, quant_report = quant_model(model, args)
+    else:
+        model_list, quant_ckt, quant_report = [deepcopy(model)], None, None
+        dump_vis = False
+        huffman_coding = False
     metrics_by_variant = {}
     dequant_vid_embed = None
     quant_embed = None
-    lpips_model = build_lpips_model(next(model.parameters()).device)
+    lpips_model = build_lpips_model(next(model.parameters()).device) if full_evaluation else None
 
     for model_ind, cur_model in enumerate(model_list):
         variant = "quant" if model_ind else "orig"
@@ -827,13 +998,13 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
             else:
                 raw_output, embed_list, dec_time = cur_model(cur_input, input_embed)
                 aux = None
-            if torch.cuda.is_available():
+            if (args.measure_latency or (full_evaluation and args.eval_fps)) and torch.cuda.is_available():
                 torch.cuda.synchronize()
             fwd_time += time.time() - fwd_start
 
-            if model_ind == 0:
+            if full_evaluation and model_ind == 0:
                 img_embed_list.append(embed_list[0])
-            if args.eval_fps:
+            if full_evaluation and args.eval_fps:
                 for _ in range(100):
                     if is_chroma420_experiment(args):
                         raw_output, embed_list, _, aux = cur_model(cur_input, embed_list[0], return_aux=True)
@@ -851,24 +1022,29 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
             end_time += time.time() - step_start
             frame_count += gt_rgb.size(0)
 
-            batch_metrics = compute_quality_metrics(pred_rgb, gt_rgb, pred_ycbcr, gt_ycbcr)
+            batch_metrics = (
+                compute_quality_metrics(pred_rgb, gt_rgb, pred_ycbcr, gt_ycbcr)
+                if full_evaluation else compute_quick_quality_metrics(
+                    pred_rgb, gt_rgb, pred_ycbcr, gt_ycbcr))
             for key, values in batch_metrics.items():
                 metric_lists[key].extend(values)
             frame_psnr.extend(batch_metrics["frame_psnr_mean"])
             frame_y_psnr.extend(batch_metrics["frame_y_psnr_mean"])
 
-            if lpips_model is not None:
+            if full_evaluation and lpips_model is not None:
                 try:
                     lp = lpips_model(pred_rgb * 2 - 1, gt_rgb * 2 - 1).flatten().detach().cpu().tolist()
                     lpips_vals.extend(lp)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"LPIPS evaluation failed at batch {i}: {exc}", flush=True)
+                    lpips_model = None
 
-            for batch_ind, cur_img_idx in enumerate(img_idx.detach().cpu().tolist()):
-                err = (pred_rgb[batch_ind] - gt_rgb[batch_ind]).detach().cpu()
-                if prev_err is not None and cur_img_idx == prev_idx + 1:
-                    temporal_diffs.append(torch.mean(torch.abs(err - prev_err)).item())
-                prev_idx, prev_err = cur_img_idx, err
+            if full_evaluation:
+                for batch_ind, cur_img_idx in enumerate(img_idx.detach().cpu().tolist()):
+                    err = (pred_rgb[batch_ind] - gt_rgb[batch_ind]).detach().cpu()
+                    if prev_err is not None and cur_img_idx == prev_idx + 1:
+                        temporal_diffs.append(torch.mean(torch.abs(err - prev_err)).item())
+                    prev_idx, prev_err = cur_img_idx, err
 
             if dump_vis:
                 for batch_ind, _ in enumerate(img_idx):
@@ -878,10 +1054,12 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
                     save_image(concat_img, f"{visual_dir}/pred_{full_ind:04d}_{temp_psnr:.2f}.png")
 
             if i % args.print_freq == 0 or i == len(full_dataloader) - 1:
-                fps = frame_count / max(fwd_time, 1e-12)
+                timing = (
+                    f", FPS {round(frame_count / max(fwd_time, 1e-12), 1)}"
+                    if full_evaluation and (args.measure_latency or args.eval_fps) else "")
                 print_str = (
                     f"[{datetime.now().strftime('%Y/%m/%d %H:%M:%S')}] Rank:{local_rank}, "
-                    f"Eval {variant} Step [{i + 1}/{len(full_dataloader)}], FPS {round(fps, 1)}, "
+                    f"Eval {variant} Step [{i + 1}/{len(full_dataloader)}]{timing}, "
                     f"rgb_psnr: {safe_mean(metric_lists['rgb_psnr']):.2f}"
                 )
                 if local_rank in [0, None]:
@@ -890,11 +1068,14 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
                         f.write(print_str + "\n")
 
         metrics = summarize_metrics(args, metric_lists, frame_psnr, frame_y_psnr, temporal_diffs, lpips_vals)
-        metrics["model_fps"] = frame_count / max(fwd_time, 1e-12) if frame_count else float("nan")
-        metrics["end_to_end_fps"] = frame_count / max(end_time, 1e-12) if frame_count else float("nan")
+        timing_enabled = full_evaluation and (args.measure_latency or args.eval_fps)
+        metrics["model_fps"] = (
+            frame_count / max(fwd_time, 1e-12) if frame_count and timing_enabled else float("nan"))
+        metrics["end_to_end_fps"] = (
+            frame_count / max(end_time, 1e-12) if frame_count and timing_enabled else float("nan"))
         metrics_by_variant[variant] = metrics
 
-        if model_ind == 0 and quantization_enabled(args):
+        if full_evaluation and model_ind == 0 and quantization_enabled(args):
             vid_embed = torch.cat(img_embed_list, 0)
             quant_embed, dequant_embed = quant_tensor(vid_embed, args.quant_embed_bit, args.quant_axis)
             dequant_vid_embed = dequant_embed.split(args.batchSize, dim=0)
@@ -932,10 +1113,19 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
         args.legacy_uint8_checkpoint_size_MB = quant_report["storage"]["legacy_uint8_checkpoint_size_MB"]
         quant_vid = packed_vid if args.quant_storage_mode == "packed" else legacy_vid
         quant_path = f"{args.outf}/quant_vid.pth"
-        torch.save(quant_vid, quant_path)
+        atomic_torch_save(quant_vid, quant_path)
         base_model = unwrap_model(model)
         if isinstance(base_model, HNeRV):
-            torch.jit.save(torch.jit.trace(HNeRVDecoder(base_model), (vid_embed[:2])), f"{args.outf}/img_decoder.pth")
+            decoder_path = f"{args.outf}/img_decoder.pth"
+            decoder_temporary = decoder_path + ".tmp"
+            try:
+                torch.jit.save(
+                    torch.jit.trace(HNeRVDecoder(base_model), (vid_embed[:2])),
+                    decoder_temporary)
+                os.replace(decoder_temporary, decoder_path)
+            finally:
+                if os.path.exists(decoder_temporary):
+                    os.remove(decoder_temporary)
         else:
             print("Skipping TorchScript decoder export for split ChromaHNeRV model.", flush=True)
         for metrics in metrics_by_variant.values():
@@ -943,6 +1133,22 @@ def evaluate(model, full_dataloader, local_rank, args, dump_vis=False, huffman_c
 
     h, w = img_data.shape[-2:]
     return metrics_by_variant, (h, w)
+
+
+def compute_quick_quality_metrics(pred_rgb, gt_rgb, pred_ycbcr, gt_ycbcr):
+    eps = 1e-9
+    mse_rgb = F.mse_loss(pred_rgb, gt_rgb, reduction="none").flatten(1).mean(1).detach().cpu()
+    rgb_psnr = (-10 * torch.log10(mse_rgb + eps)).tolist()
+    mse_y = F.mse_loss(
+        pred_ycbcr[:, 0:1], gt_ycbcr[:, 0:1],
+        reduction="none").flatten(1).mean(1).detach().cpu()
+    y_psnr = (-10 * torch.log10(mse_y + eps)).tolist()
+    return {
+        "rgb_psnr": rgb_psnr,
+        "psnr_y": y_psnr,
+        "frame_psnr_mean": rgb_psnr,
+        "frame_y_psnr_mean": y_psnr,
+    }
 
 
 def compute_quality_metrics(pred_rgb, gt_rgb, pred_ycbcr, gt_ycbcr):
@@ -1134,6 +1340,12 @@ def build_result_row(args, metrics_by_variant):
         "crop_list": args.crop_list,
         "resize_list": args.resize_list,
         "data_split": args.data_split,
+        "dataset_preset": args.dataset_preset,
+        "detected_frames": getattr(args, "detected_frames", float("nan")),
+        "detected_source_height": getattr(args, "detected_source_height", float("nan")),
+        "detected_source_width": getattr(args, "detected_source_width", float("nan")),
+        "detected_final_height": getattr(args, "detected_final_height", float("nan")),
+        "detected_final_width": getattr(args, "detected_final_width", float("nan")),
         "enc_strds": args.enc_strd_str,
         "dec_strds": args.dec_strd_str,
         "enc_dim": args.enc_dim,
@@ -1170,6 +1382,17 @@ def build_result_row(args, metrics_by_variant):
         "chroma_output_resolution": (
             "_".join(str(int(value) // args.chroma_scale) for value in args.crop_list.split("_"))
             if is_chroma420_experiment(args) else args.crop_list),
+        "decoder_stage_resolutions": args.decoder_stage_resolutions,
+        "split_alias": args.split_alias,
+        "split_stage_index": args.split_stage_index,
+        "shared_output_height": args.shared_output_height,
+        "shared_output_width": args.shared_output_width,
+        "chroma_output_height": args.chroma_output_height,
+        "chroma_output_width": args.chroma_output_width,
+        "final_output_height": args.final_output_height,
+        "final_output_width": args.final_output_width,
+        "intermediate_eval_mode": args.intermediate_eval_mode,
+        "final_eval_mode": args.final_eval_mode,
     }
     for group in ["shared", "rgb", "y", "chroma", "model"]:
         row[f"architecture_{group}_param_count"] = getattr(args, f"architecture_{group}_param_count", 0)

@@ -118,6 +118,7 @@ class _SplitBase(nn.Module):
             self.pe_embed = base.pe_embed
         self.fc_h, self.fc_w = base.fc_h, base.fc_w
         self.out_bias = base.out_bias
+        self.measure_latency = getattr(args, "measure_latency", False) or getattr(args, "eval_fps", False)
         self.split_stage = args.split_stage
         self.branch_width_mode = getattr(args, "branch_width_mode", "fixed")
         self.rgb_or_y_stage_indices = split["rgb_or_y_stage_indices"]
@@ -179,7 +180,7 @@ class RGBSplitHNeRV(_SplitBase):
         rgb_feat = self.rgb_branch(shared)
         embed_list.append(rgb_feat)
         img_out = OutImg(self.rgb_head(rgb_feat), self.out_bias)
-        if torch.cuda.is_available():
+        if self.measure_latency and torch.cuda.is_available():
             torch.cuda.synchronize()
         dec_time = time.time() - dec_start
         return img_out, embed_list, dec_time
@@ -224,7 +225,7 @@ class ChromaHNeRV420(_SplitBase):
         ycbcr = torch.cat([y, cbcr_up], dim=1)
         rgb = ycbcr_to_rgb_bt709(ycbcr).clamp(0, 1)
 
-        if torch.cuda.is_available():
+        if self.measure_latency and torch.cuda.is_available():
             torch.cuda.synchronize()
         dec_time = time.time() - dec_start
         if return_aux:
