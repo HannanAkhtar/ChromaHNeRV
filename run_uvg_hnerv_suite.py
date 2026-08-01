@@ -32,7 +32,7 @@ def parse_args(argv=None):
     repo_default = str(Path(__file__).resolve().parent)
     parser = argparse.ArgumentParser(description="Sequential seven-sequence UVG HNeRV suite launcher.")
     parser.add_argument("--repo-root", default=repo_default)
-    parser.add_argument("--data-root", default="/data/UVG")
+    parser.add_argument("--data-root", default="data/uvg")
     parser.add_argument("--output-root", default="output/uvg7_hnerv_150e")
     parser.add_argument("--backup-root", default="")
     parser.add_argument("--manifest", default="configs/uvg7.json")
