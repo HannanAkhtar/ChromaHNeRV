@@ -25,11 +25,11 @@ def main():
     import imageio.v2 as imageio
     from torchvision.utils import save_image
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--decoder', type=str, default='checkpoints/img_decoder.pth', help='path for video decoder',)
-    parser.add_argument('--ckt', type=str, default='checkpoints/quant_vid.pth', help='path for video checkpoint',) #
-    parser.add_argument('--dump_dir', type=str, default='visualize/bunny_1.5M_E300', help='path for video checkpoint',) #
-    parser.add_argument('--frames', type=int, default=16, help='video frames for output',) #
+    parser = argparse.ArgumentParser(description="Decode frames from a packed HNeRV checkpoint.")
+    parser.add_argument('--decoder', required=True, help='path to img_decoder.pth')
+    parser.add_argument('--ckt', required=True, help='path to quant_vid.pth')
+    parser.add_argument('--dump_dir', default='output/decoded', help='directory for decoded frames')
+    parser.add_argument('--frames', type=int, default=16, help='number of frames to output')
 
     args = parser.parse_args()
 

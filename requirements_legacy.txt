@@ -1,3 +1,4 @@
+# Historical upstream HNeRV environment. Use requirements.txt for this release.
 matplotlib
 pandas
 tensorboard

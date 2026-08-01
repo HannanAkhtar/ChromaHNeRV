@@ -9,7 +9,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_no_active_pytorchvideo_import_or_modern_requirement():
+def test_no_active_pytorchvideo_import_or_primary_requirement():
     for path in ROOT.glob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         imports = [
@@ -17,7 +17,7 @@ def test_no_active_pytorchvideo_import_or_modern_requirement():
             if isinstance(node, ast.ImportFrom) and node.module
         ]
         assert not any(name.startswith("pytorchvideo") for name in imports)
-    requirements = (ROOT / "requirements_modern.txt").read_text(
+    requirements = (ROOT / "requirements.txt").read_text(
         encoding="utf-8").lower()
     assert "pytorchvideo" not in requirements
     assert "decord" in requirements
