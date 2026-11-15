@@ -58,11 +58,21 @@ def command_for(job, args, run_dir, source):
             raise ValueError("Bunny requires --bunny-command from the original checkpoint")
         historical = shlex.split(Path(args.bunny_command).read_text(encoding="utf-8"))
         for option in ("--enc_strds", "--dec_strds", "--crop_list", "--resize_list",
-                       "--enc_dim", "--ks", "--reduce", "--lower_width", "--loss"):
+                       "--enc_dim", "--ks", "--reduce", "--lower_width", "--loss",
+                       "--conv_type", "--act", "--norm", "--lr", "--lr_type",
+                       "--batchSize", "--eval_freq", "--num_blks", "--block_params"):
             if option not in historical:
-                raise ValueError(f"Original Bunny command lacks {option}")
-            index = historical.index(option) + 1
-            count = 5 if option in ("--enc_strds", "--dec_strds") else 1
+                if option == "--batchSize" and "-b" in historical:
+                    original_option = "-b"
+                elif option in ("--conv_type", "--act", "--norm", "--lr", "--lr_type",
+                                "--batchSize", "--eval_freq", "--num_blks", "--block_params"):
+                    continue
+                else:
+                    raise ValueError(f"Original Bunny command lacks {option}")
+            else:
+                original_option = option
+            index = historical.index(original_option) + 1
+            count = 5 if option in ("--enc_strds", "--dec_strds") else 2 if option == "--conv_type" else 1
             values = historical[index:index + count]
             if len(values) != count:
                 raise ValueError(f"Original Bunny command has incomplete {option}")
