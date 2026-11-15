@@ -30,7 +30,7 @@ from torchvision.utils import save_image
 
 from hnerv_utils import *
 from model_all import HNeRV, HNeRVDecoder, TransformInput, VideoDataSet, decoder_channel_schedule
-from model_chroma_hnerv import ChromaHNeRV420, RGBSplitHNeRV
+from model_chroma_hnerv import ChromaHNeRV420, RGBSplitHNeRV, YCbCrSplit444HNeRV
 from uvg_utils import (
     apply_dataset_preset, atomic_torch_save, backup_artifact_names,
     checkpoint_best_rgb_psnr, split_resolution_metadata,
@@ -39,8 +39,9 @@ from uvg_utils import (
 
 
 RGB_STYLE_EXPERIMENTS = ("rgb444_hnerv", "rgbsplit_a320", "rgbsplit_a160")
+YC_MATCHED_EXPERIMENTS = ("rgbsplit_yc_a320", "ycbcrsplit444_a320")
 CHROMA420_EXPERIMENTS = ("chroma420_a320", "chroma420_a160")
-SPLIT_EXPERIMENTS = ("rgbsplit_a320", "chroma420_a320", "rgbsplit_a160", "chroma420_a160")
+SPLIT_EXPERIMENTS = ("rgbsplit_a320", "chroma420_a320", "rgbsplit_a160", "chroma420_a160") + YC_MATCHED_EXPERIMENTS
 CHROMA_EXPERIMENTS = ("rgb444_hnerv", "ycbcr444_hnerv") + SPLIT_EXPERIMENTS
 METRIC_COLUMNS = [
     "params_M", "encoder_params_M", "decoder_params_M", "embed_params_M",
@@ -157,6 +158,7 @@ Sanity-check examples (small/debug only, not full experiments):
     parser.add_argument("--suffix", default="", help="suffix str for outf")
     parser.add_argument("--backup_root", default="")
     parser.add_argument("--backup_at_eval", action="store_true")
+    parser.add_argument("--backup_every_epochs", type=int, default=0)
     parser.add_argument("--strict_backup", action="store_true")
     parser.add_argument("--launcher_log_path", default="")
 
@@ -197,7 +199,7 @@ def main():
 
 def normalize_experiment_args(args):
     lambda_rgb_was_explicit = any(arg == "--lambda_rgb" or arg.startswith("--lambda_rgb=") for arg in sys.argv[1:])
-    if args.experiment in CHROMA420_EXPERIMENTS and not lambda_rgb_was_explicit:
+    if args.experiment in CHROMA420_EXPERIMENTS + YC_MATCHED_EXPERIMENTS and not lambda_rgb_was_explicit:
         args.lambda_rgb = 0.1
     branch_width_explicit = any(arg == "--branch_width" or arg.startswith("--branch_width=") for arg in sys.argv[1:])
     if args.branch_width_mode == "native" and branch_width_explicit:
@@ -433,6 +435,11 @@ def architecture_metadata(args):
             "chroma_scale": 1,
             "output_sample_ratio": 1.0,
         }
+    if args.experiment == "ycbcrsplit444_a320":
+        return {"architecture": args.experiment, "chroma_format": "444",
+                "split_stage": args.split_stage, "branch_width": args.branch_width,
+                "branch_width_mode": args.branch_width_mode, "chroma_scale": 1,
+                "output_sample_ratio": 1.0}
     if is_chroma420_experiment(args):
         return {
             "architecture": args.experiment,
@@ -451,6 +458,8 @@ def build_model(args):
         return HNeRV(args)
     if args.experiment.startswith("rgbsplit_"):
         return RGBSplitHNeRV(args)
+    if args.experiment == "ycbcrsplit444_a320":
+        return YCbCrSplit444HNeRV(args)
     if is_chroma420_experiment(args):
         return ChromaHNeRV420(args)
     raise ValueError(f"Unsupported experiment: {args.experiment}")
@@ -531,13 +540,13 @@ def attach_param_counts(args, model):
 
 
 def interpret_prediction(raw_output, args, aux=None):
-    if args.experiment in RGB_STYLE_EXPERIMENTS:
+    if args.experiment in RGB_STYLE_EXPERIMENTS or args.experiment == "rgbsplit_yc_a320":
         rgb = raw_output
         ycbcr = rgb_to_ycbcr_bt709(rgb)
     elif args.experiment == "ycbcr444_hnerv":
         ycbcr = raw_output
         rgb = ycbcr_to_rgb_bt709(ycbcr)
-    elif is_chroma420_experiment(args):
+    elif is_chroma420_experiment(args) or args.experiment == "ycbcrsplit444_a320":
         rgb = aux["rgb"] if aux is not None and "rgb" in aux else raw_output
         ycbcr = aux["ycbcr"] if aux is not None and "ycbcr" in aux else rgb_to_ycbcr_bt709(rgb)
     else:
@@ -555,6 +564,26 @@ def area_downsample_chroma(chroma, scale):
 
 
 def compute_train_loss(raw_output, img_gt, inpaint_mask, args, aux=None):
+    if args.experiment in YC_MATCHED_EXPERIMENTS:
+        if "inpaint" in args.vid:
+            raise NotImplementedError("Matched Y/C inpainting is unsupported.")
+        target = rgb_to_ycbcr_bt709(img_gt)
+        if args.experiment == "rgbsplit_yc_a320":
+            rgb = raw_output
+            predicted = rgb_to_ycbcr_bt709(rgb)
+        else:
+            if aux is None:
+                raise ValueError("YCbCrSplit444 requires auxiliary outputs")
+            rgb, predicted = aux["rgb"], aux["ycbcr"]
+        loss_y = F.mse_loss(predicted[:, :1], target[:, :1])
+        loss_c = F.mse_loss(
+            area_downsample_chroma(predicted[:, 1:3], 2),
+            area_downsample_chroma(target[:, 1:3], 2))
+        loss_rgb = F.mse_loss(rgb, img_gt)
+        total = loss_y + loss_c + 0.1 * loss_rgb
+        return total, {"loss": total.detach(), "loss_total": total.detach(),
+                       "loss_y": loss_y.detach(), "loss_c": loss_c.detach(),
+                       "loss_rgb": loss_rgb.detach()}
     if args.experiment in RGB_STYLE_EXPERIMENTS:
         loss = loss_fn(raw_output * inpaint_mask, img_gt * inpaint_mask, args.loss)
         return loss, {"loss": loss.detach(), "loss_rgb": loss.detach()}
@@ -814,7 +843,7 @@ def train(local_rank, args):
             cur_input = norm_idx if "pe" in args.embed else img_data
             cur_epoch = (epoch + float(i) / len(train_dataloader)) / args.epochs
             lr = adjust_lr(optimizer, cur_epoch, args)
-            if is_chroma420_experiment(args):
+            if is_chroma420_experiment(args) or args.experiment == "ycbcrsplit444_a320":
                 raw_output, _, _, aux = model(cur_input, return_aux=True)
             else:
                 raw_output, _, _ = model(cur_input)
@@ -905,7 +934,8 @@ def train(local_rank, args):
             atomic_torch_save(save_checkpoint, f"{args.outf}/model_latest.pth")
             if evaluated_this_epoch and is_best_epoch:
                 atomic_torch_save(save_checkpoint, f"{args.outf}/model_best.pth")
-            if evaluated_this_epoch and args.backup_at_eval:
+            if (evaluated_this_epoch and args.backup_at_eval) or (
+                    args.backup_every_epochs > 0 and (epoch + 1) % args.backup_every_epochs == 0):
                 backup_run_artifacts(args)
             if epoch + 1 == args.epochs:
                 args.cur_epoch = epoch + 1
@@ -1019,7 +1049,7 @@ def evaluate(
 
             fwd_start = time.time()
             input_embed = dequant_vid_embed[i] if model_ind else None
-            if is_chroma420_experiment(args):
+            if is_chroma420_experiment(args) or args.experiment == "ycbcrsplit444_a320":
                 raw_output, embed_list, dec_time, aux = cur_model(cur_input, input_embed, return_aux=True)
             else:
                 raw_output, embed_list, dec_time = cur_model(cur_input, input_embed)
@@ -1032,7 +1062,7 @@ def evaluate(
                 img_embed_list.append(embed_list[0])
             if full_evaluation and args.eval_fps:
                 for _ in range(100):
-                    if is_chroma420_experiment(args):
+                    if is_chroma420_experiment(args) or args.experiment == "ycbcrsplit444_a320":
                         raw_output, embed_list, _, aux = cur_model(cur_input, embed_list[0], return_aux=True)
                     else:
                         raw_output, embed_list, _ = cur_model(cur_input, embed_list[0])
@@ -1524,7 +1554,7 @@ def effective_quant_bits(args):
     if args.quant_scheme == "uniform":
         if args.experiment.startswith("rgbsplit_"):
             bits.update(shared=args.quant_model_bit, rgb=args.quant_model_bit)
-        elif args.experiment.startswith("chroma420_"):
+        elif args.experiment.startswith("chroma420_") or args.experiment == "ycbcrsplit444_a320":
             bits.update(shared=args.quant_model_bit, y=args.quant_model_bit, chroma=args.quant_model_bit)
     return bits
 

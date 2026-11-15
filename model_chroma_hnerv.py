@@ -186,6 +186,35 @@ class RGBSplitHNeRV(_SplitBase):
         return img_out, embed_list, dec_time
 
 
+class YCbCrSplit444HNeRV(_SplitBase):
+    def __init__(self, args):
+        super().__init__(args)
+        self.y_branch = self._make_branch(args, self.rgb_or_y_stage_indices)
+        self.cbcr_branch = self._make_branch(args, self.rgb_or_y_stage_indices)
+        self.y_branch_channels = self._branch_schedule(args, self.rgb_or_y_stage_indices)
+        self.chroma_branch_channels = self.y_branch_channels
+        self.y_head = nn.Conv2d(self.y_branch_channels[-1], 1, 3, 1, 1)
+        self.cbcr_head = nn.Conv2d(self.chroma_branch_channels[-1], 2, 3, 1, 1)
+        object.__delattr__(self, "_base_decoder_ref")
+
+    def forward(self, input, input_embed=None, encode_only=False, return_aux=False):
+        dec_start = time.time()
+        shared, embed_list = self._shared_forward(input, input_embed)
+        y_feat = self.y_branch(shared)
+        cbcr_feat = self.cbcr_branch(shared)
+        y = OutImg(self.y_head(y_feat), self.out_bias)
+        cbcr = OutImg(self.cbcr_head(cbcr_feat), self.out_bias)
+        ycbcr = torch.cat([y, cbcr], dim=1)
+        rgb = ycbcr_to_rgb_bt709(ycbcr).clamp(0, 1)
+        embed_list.extend([y_feat, cbcr_feat])
+        if self.measure_latency and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dec_time = time.time() - dec_start
+        if return_aux:
+            return rgb, embed_list, dec_time, {"rgb": rgb, "ycbcr": ycbcr, "y": y, "cbcr": cbcr}
+        return rgb, embed_list, dec_time
+
+
 class ChromaHNeRV420(_SplitBase):
     def __init__(self, args):
         super().__init__(args)

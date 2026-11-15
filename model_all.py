@@ -200,7 +200,7 @@ class HNeRV(nn.Module):
         self.measure_latency = getattr(args, "measure_latency", False) or getattr(args, "eval_fps", False)
 
     def forward(self, input, input_embed=None, encode_only=False):
-        if input_embed != None:
+        if input_embed is not None:
             img_embed = input_embed
         else:
             if 'pe' in self.embed:
