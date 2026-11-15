@@ -76,19 +76,21 @@ def command_for(job, args, run_dir, source):
             values = historical[index:index + count]
             if len(values) != count:
                 raise ValueError(f"Original Bunny command has incomplete {option}")
+            if option == "--crop_list" and values[0] != "640_1280":
+                raise ValueError(f"Original Bunny crop must be 640_1280, got {values[0]}")
             command.extend([option, *values])
     else:
         command.extend(["--dataset_preset", "uvg_hnerv", "--expected_source_height", "1080",
                         "--expected_source_width", "1920"])
     if args.backup_root:
         command.extend(["--backup_root", str(Path(args.backup_root).resolve()),
-                        "--backup_every_epochs", "5", "--backup_at_eval"])
+                        "--backup_every_epochs", "1", "--backup_at_eval"])
         if args.strict_backup:
             command.append("--strict_backup")
     return command
 
 
-def preflight(job, source, metadata):
+def preflight(job, source, metadata, command=None):
     files = discover_image_files(source)
     if len(files) != 132 or metadata["frames"] != 132:
         raise ValueError(f"{job['sequence']}: expected exactly 132 frames, found {len(files)}")
@@ -101,6 +103,36 @@ def preflight(job, source, metadata):
         raise ValueError(f"{job['sequence']}: source smaller than crop")
     if "source_height" in metadata and (height, width) != (metadata["source_height"], metadata["source_width"]):
         raise ValueError(f"{job['sequence']}: expected source {metadata['source_height']}x{metadata['source_width']}, got {height}x{width}")
+    if command is not None:
+        from model_all import VideoDataSet
+        from train_chroma_hnerv import build_parser
+        from uvg_utils import apply_dataset_preset
+        tokens = command[2:]
+        parser = build_parser()
+        dataset_args = parser.parse_args(tokens)
+        apply_dataset_preset(dataset_args, parser, tokens)
+        dataset = VideoDataSet(dataset_args)
+        expected = (metadata["crop_height"], metadata["crop_width"])
+        if (dataset.final_height, dataset.final_width) != expected:
+            raise ValueError(f"{job['sequence']}: transformed frames must be {expected}, "
+                             f"got {(dataset.final_height, dataset.final_width)}")
+
+
+def validate_phase2_completion(run_dir, job, epochs):
+    """Reject incomplete final evaluation even when the trainer exited normally."""
+    import torch
+    run_dir = Path(run_dir)
+    require_complete_run(run_dir, epochs)
+    completion = json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))
+    checkpoint = torch.load(run_dir / f"epoch{epochs}.pth", map_location="cpu")
+    with (run_dir / f"epoch{epochs}.csv").open(newline="", encoding="utf-8") as file:
+        rows = list(csv.DictReader(file))
+    if (completion.get("epoch") != epochs or completion.get("run_name") != job["run_id"] or
+            checkpoint.get("epoch") != epochs or "optimizer" not in checkpoint or
+            len(rows) != 1 or rows[0].get("experiment") != job["variant"] or
+            rows[0].get("manualSeed") != "1" or rows[0].get("quant_rgb_psnr", "") in ("", "nan") or
+            rows[0].get("quant_model_bit") != "8" or rows[0].get("quant_embed_bit") != "6"):
+        raise RuntimeError(f"Incomplete or invalid Phase 2 final artifacts: {run_dir}")
 
 
 def main(argv=None):
@@ -133,7 +165,8 @@ def main(argv=None):
             raise FileNotFoundError("Bunny archive must be extracted and --bunny-root supplied")
         if job["sequence"] == "Bunny" and not args.bunny_command:
             raise FileNotFoundError("Provide original Bunny --bunny-command for historical preprocessing")
-        preflight(job, Path(item["source"]), metadata[job["sequence"]])
+        preflight(job, Path(item["source"]), metadata[job["sequence"]],
+                  command_for(job, args, Path(item["run_dir"]), Path(item["source"])))
     output.mkdir(parents=True, exist_ok=True)
     with (output / "phase2_plan.csv").open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=plan[0].keys() if plan else
@@ -145,11 +178,13 @@ def main(argv=None):
         if backup_run:
             print("RESTORE", restore_run_from_backup(run_dir, backup_run, args.epochs))
         try:
-            require_complete_run(run_dir, args.epochs)
+            validate_phase2_completion(run_dir, job, args.epochs)
             print("SKIP complete", job["run_id"])
             continue
         except RuntimeError:
             pass
+        if (run_dir / "completion.json").exists():
+            raise RuntimeError(f"Completion marker exists but final artifacts are invalid: {run_dir}")
         if run_dir.exists() and not (run_dir / "model_latest.pth").exists():
             raise RuntimeError(f"Incomplete run without resumable checkpoint: {run_dir}")
         log = output / "logs" / (job["run_id"] + ".log")
@@ -160,7 +195,7 @@ def main(argv=None):
         if code:
             write_failure(run_dir, job["run_id"], return_code=code)
             raise RuntimeError(f"Trainer failed for {job['run_id']}: {code}")
-        require_complete_run(run_dir, args.epochs)
+        validate_phase2_completion(run_dir, job, args.epochs)
         cleanup_stale_failure_markers(run_dir, backup_run)
     return plan
 

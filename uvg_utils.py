@@ -289,7 +289,8 @@ def restore_run_from_backup(local_run_dir, backup_run_dir, epochs):
         return summary
 
     for backup_path in backup_run_dir.rglob("*"):
-        if not backup_path.is_file() or backup_path.suffix.lower() in IMAGE_EXTENSIONS:
+        if (not backup_path.is_file() or backup_path.suffix.lower() in IMAGE_EXTENSIONS or
+                backup_path.name.endswith(".tmp")):
             continue
         relative_path = backup_path.relative_to(backup_run_dir)
         local_path = local_run_dir / relative_path
@@ -308,6 +309,13 @@ def restore_run_from_backup(local_run_dir, backup_run_dir, epochs):
         if local_path.exists() and local_valid:
             should_restore = (
                 backup_path.stat().st_mtime > local_path.stat().st_mtime)
+            if backup_path.name == "model_latest.pth":
+                import torch
+                local_epoch = torch.load(local_path, map_location="cpu").get("epoch")
+                backup_epoch = torch.load(backup_path, map_location="cpu").get("epoch")
+                if local_epoch is not None and backup_epoch is not None:
+                    should_restore = backup_epoch > local_epoch or (
+                        backup_epoch == local_epoch and should_restore)
         if should_restore:
             local_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(backup_path, local_path)

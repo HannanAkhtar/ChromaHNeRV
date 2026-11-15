@@ -87,7 +87,9 @@ class VideoDataSet(Dataset):
         if self.resize_list != '-1':
             if '_' in self.resize_list:
                 resize_h, resize_w = [int(x) for x in self.resize_list.split('_')]
-                img = interpolate(img, (resize_h, resize_w), 'bicubic')
+                img = interpolate(
+                    img.unsqueeze(0), size=(resize_h, resize_w), mode='bicubic',
+                    align_corners=False).squeeze(0)
             else:
                 resize_hw = int(self.resize_list)
                 img = resize(img, resize_hw,  'bicubic')

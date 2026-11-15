@@ -46,7 +46,7 @@ CHROMA_EXPERIMENTS = ("rgb444_hnerv", "ycbcr444_hnerv") + SPLIT_EXPERIMENTS
 METRIC_COLUMNS = [
     "params_M", "encoder_params_M", "decoder_params_M", "embed_params_M",
     "actual_total_params_M", "modelsize_target_M", "checkpoint_size_MB",
-    "estimated_gflops", "model_fps", "end_to_end_fps", "output_sample_ratio",
+    "estimated_gflops", "decoder_gflops", "model_fps", "end_to_end_fps", "output_sample_ratio",
     "quant_model_bit", "quant_embed_bit", "bits_per_param",
     "bits_per_param_with_overhead", "bits_per_pixel",
     "rgb_psnr", "rgb_ms_ssim", "psnr_y", "psnr_cb", "psnr_cr",
@@ -201,6 +201,10 @@ def normalize_experiment_args(args):
     lambda_rgb_was_explicit = any(arg == "--lambda_rgb" or arg.startswith("--lambda_rgb=") for arg in sys.argv[1:])
     if args.experiment in CHROMA420_EXPERIMENTS + YC_MATCHED_EXPERIMENTS and not lambda_rgb_was_explicit:
         args.lambda_rgb = 0.1
+    if args.experiment in YC_MATCHED_EXPERIMENTS and (
+            args.lambda_y != 1.0 or args.lambda_c != 1.0 or args.lambda_rgb != 0.1 or
+            args.chroma_scale != 2 or args.chroma_downsample != "area"):
+        raise ValueError("Phase 2 matched Y/C controls require Y=1, C=1, RGB=0.1 and area-downsampled 2x chroma")
     branch_width_explicit = any(arg == "--branch_width" or arg.startswith("--branch_width=") for arg in sys.argv[1:])
     if args.branch_width_mode == "native" and branch_width_explicit:
         raise ValueError("--branch_width must not be supplied with --branch_width_mode native.")
@@ -337,6 +341,7 @@ def write_run_metadata(args):
     metadata = {key: _json_safe(value) for key, value in vars(args).items()
                 if key not in {"transform_func"}}
     metadata.update({
+        "objective": objective_name(args),
         "sequence_name": args.vid,
         "dataset_path": args.data_path,
         "timestamp": datetime.now().astimezone().isoformat(),
@@ -386,7 +391,14 @@ def backup_run_artifacts(args, final=False):
         os.makedirs(destination, exist_ok=True)
         for source in backup_artifact_sources(args, final):
             if os.path.isfile(source):
-                shutil.copy2(source, os.path.join(destination, os.path.basename(source)))
+                target = os.path.join(destination, os.path.basename(source))
+                temporary = target + ".tmp"
+                try:
+                    shutil.copy2(source, temporary)
+                    os.replace(temporary, target)
+                finally:
+                    if os.path.exists(temporary):
+                        os.remove(temporary)
     except Exception as exc:
         message = f"Backup failed for {args.outf}: {exc}"
         print(message, flush=True)
@@ -404,6 +416,14 @@ def unwrap_model(model):
 
 def is_chroma420_experiment(args):
     return args.experiment in CHROMA420_EXPERIMENTS
+
+
+def objective_name(args):
+    if args.experiment in YC_MATCHED_EXPERIMENTS:
+        return "BT709_Y_MSE_CbCr_area2_MSE_RGB_MSE_0.1"
+    if args.experiment in CHROMA420_EXPERIMENTS:
+        return "BT709_Y_MSE_CbCr_low_MSE_RGB_MSE"
+    return args.loss
 
 
 def is_split_experiment(args):
@@ -681,7 +701,12 @@ def safe_ssim(pred, target):
 
 
 @torch.no_grad()
-def estimate_gflops(model, full_dataloader, args, device):
+def estimate_gflops(model, full_dataloader, args, device, decoder_only=False):
+    """Count Conv2d, ConvTranspose2d and Linear MACs (two FLOPs per MAC).
+
+    Pointwise activations, normalization, interpolation, colour conversion and
+    reshapes are not counted. The historical default includes the encoder.
+    """
     base = unwrap_model(model)
     was_training = base.training
     base.eval()
@@ -701,19 +726,24 @@ def estimate_gflops(model, full_dataloader, args, device):
         out = output[0] if isinstance(output, tuple) else output
         flops["total"] += out.numel() * module.in_features * 2
 
-    for module in base.modules():
-        if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
-            handles.append(module.register_forward_hook(conv_hook))
-        elif isinstance(module, nn.Linear):
-            handles.append(module.register_forward_hook(linear_hook))
-
     try:
         sample = next(iter(full_dataloader))
         img_data = data_to_gpu(sample["img"], device)
         norm_idx = data_to_gpu(sample["norm_idx"], device)
         img_data, _, _ = args.transform_func(img_data)
         cur_input = norm_idx if "pe" in args.embed else img_data
-        base(cur_input)
+        if decoder_only:
+            encoded_input = base.pe_embed(cur_input[:, None]).float() if "pe" in args.embed else cur_input
+            embedding = base.encoder(encoded_input)
+        for module in base.modules():
+            if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
+                handles.append(module.register_forward_hook(conv_hook))
+            elif isinstance(module, nn.Linear):
+                handles.append(module.register_forward_hook(linear_hook))
+        if decoder_only:
+            base(cur_input, input_embed=embedding)
+        else:
+            base(cur_input)
         return flops["total"] / max(cur_input.size(0), 1) / 1e9
     except Exception as exc:
         print(f"GFLOP estimate unavailable, logging nan ({exc})", flush=True)
@@ -786,9 +816,11 @@ def train(local_rank, args):
     device = next(model.parameters()).device
     if local_rank in [0, None]:
         args.estimated_gflops = estimate_gflops(model, full_dataloader, args, device)
+        args.decoder_gflops = estimate_gflops(model, full_dataloader, args, device, decoder_only=True)
         write_run_metadata(args)
     else:
         args.estimated_gflops = float("nan")
+        args.decoder_gflops = float("nan")
 
     if args.profile_only:
         if local_rank in [0, None]:
@@ -1244,6 +1276,7 @@ def summarize_metrics(args, metric_lists, frame_psnr, frame_y_psnr, temporal_dif
         "modelsize_target_M": args.modelsize,
         "checkpoint_size_MB": checkpoint_size_mb(args),
         "estimated_gflops": getattr(args, "estimated_gflops", float("nan")),
+        "decoder_gflops": getattr(args, "decoder_gflops", float("nan")),
         "quant_model_bit": args.quant_model_bit,
         "quant_embed_bit": args.quant_embed_bit,
         "bits_per_param": getattr(args, "bits_per_param", float("nan")),
@@ -1271,6 +1304,7 @@ def build_profile_metrics(args):
         "modelsize_target_M": args.modelsize,
         "checkpoint_size_MB": float("nan"),
         "estimated_gflops": getattr(args, "estimated_gflops", float("nan")),
+        "decoder_gflops": getattr(args, "decoder_gflops", float("nan")),
         "model_fps": float("nan"),
         "end_to_end_fps": float("nan"),
         "quant_model_bit": args.quant_model_bit,
@@ -1409,6 +1443,7 @@ def build_result_row(args, metrics_by_variant):
         "reduce": args.reduce,
         "lower_width": args.lower_width,
         "loss": args.loss,
+        "objective": objective_name(args),
         "lambda_y": args.lambda_y,
         "lambda_c": args.lambda_c,
         "lambda_rgb": args.lambda_rgb,
@@ -1506,7 +1541,7 @@ def classify_quant_group(model, parameter_name, args):
     if name.startswith("encoder."):
         return "encoder"
     base_model = unwrap_model(model)
-    if isinstance(base_model, ChromaHNeRV420):
+    if isinstance(base_model, (ChromaHNeRV420, YCbCrSplit444HNeRV)):
         prefixes = {
             "shared_decoder.": "shared", "y_branch.": "y", "y_head.": "y",
             "cbcr_branch.": "chroma", "cbcr_head.": "chroma",
