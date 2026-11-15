@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmark_decoder_latency import ARCHITECTURES, validate_manifest
+from benchmark_decoder_latency import ARCHITECTURES, cached_decoder, validate_manifest
 from run_cvpr27_phase2 import SEQUENCES, VARIANTS, jobs, main
 
 
@@ -29,6 +29,24 @@ def test_latency_manifest_rejects_missing_artifacts():
         validate_manifest({})
     with pytest.raises(ValueError, match="missing"):
         validate_manifest({name: {} for name in ARCHITECTURES})
+
+
+def test_cached_decoder_bypasses_encoder_on_cpu():
+    torch = pytest.importorskip("torch")
+    class Decoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = torch.nn.Identity()
+        def forward(self, frame, input_embed=None):
+            embedding = self.encoder(frame) if input_embed is None else input_embed
+            return embedding * 2, [], 0
+    model = Decoder()
+    frame = torch.rand(1, 3, 8, 8)
+    embedding = cached_decoder(model, frame)
+    def forbidden(_):
+        raise AssertionError("encoder ran in cached decoder path")
+    model.encoder.forward = forbidden
+    assert torch.allclose(model(frame, input_embed=embedding)[0], frame * 2)
 
 
 def test_loss_and_architecture_when_torch_available():
