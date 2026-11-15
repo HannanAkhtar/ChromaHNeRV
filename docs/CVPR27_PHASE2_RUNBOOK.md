@@ -6,7 +6,6 @@ Checkout in Colab:
 git clone https://github.com/HannanAkhtar/ChromaHNeRV.git
 cd ChromaHNeRV
 git checkout experiment/cvpr27-phase2-controls-latency
-git checkout 01ad0dc847ac31e03f9da40e69ca981bf305f366
 git rev-parse HEAD
 ```
 
